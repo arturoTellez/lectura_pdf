@@ -1,0 +1,13 @@
+pdfplumber
+pandas
+streamlit
+plotly
+openpyxl
+openai
+requests
+python-dotenv
+pymupdf
+google-genai
+
+
+
