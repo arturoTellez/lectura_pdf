@@ -918,8 +918,10 @@ class BanorteCreditParser(BankParser):
     def _parse_monto(self, txt: str) -> float:
         if not txt:
             return 0.0
-        txt = txt.replace("$", "").replace(",", "").strip()
-        m = re.search(r"-?\d+\.\d{2}", txt)
+        # Remover símbolos de moneda y comas
+        clean = txt.replace("$", "").replace(",", "").strip()
+        # Buscar el número (puede ser negativo)
+        m = re.search(r"[-]?\d+\.\d{2}", clean)
         return float(m.group(0)) if m else 0.0
 
     # Líneas MSI tipo:
@@ -933,14 +935,12 @@ class BanorteCreditParser(BankParser):
         r"(?P<tasa>[\d\.]+)%"
     )
 
-    # Líneas regulares simples tipo:
-    # 11-OCT-2025 13-OCT-2025 STARBUCKS ... +$133.00
-    REGULAR_PATTERN = re.compile(
-        r"^(?P<fecha_op>\d{2}-[A-Z]{3}-\d{4})\s+"
-        r"(?P<fecha_cargo>\d{2}-[A-Z]{3}-\d{4})\s+"
-        r"(?P<desc>.+?)\s+"
-        r"(?P<signo>[+-])\s*\$(?P<monto>[\d,]+\.\d{2})$"
-    )
+    # Inicio de movimiento regular: Fecha Op + Fecha Cargo
+    # Ejemplo: 12-NOV-2025 13-NOV-2025 ...
+    REGULAR_START_PATTERN = re.compile(r"^\d{2}-[A-Z]{3}-\d{4}\s+\d{2}-[A-Z]{3}-\d{4}")
+    
+    # Monto con signo: +$13.00 o -$12,855.46
+    AMOUNT_PATTERN = re.compile(r"[+-]\$[\d,]+\.\d{2}")
 
     def _parse_msi_section(self, lines):
         registros = []
@@ -953,8 +953,8 @@ class BanorteCreditParser(BankParser):
                 "fecha_oper": g["fecha"],
                 "fecha_liq": g["fecha"],
                 "descripcion": f"{g['desc']} ({g['num_pago']})",
-                "monto": self._parse_monto(g["pago_requerido"]),   # lo que pega al saldo este mes
-                "tipo": "Cargo",
+                "monto": self._parse_monto(g["pago_requerido"]),
+                "tipo": "Cargo MSI Informativo", # Marcado para no sumar doble
                 "categoria": "MSI",
                 "meta_monto_original": self._parse_monto(g["monto_original"]),
                 "meta_saldo_pendiente": self._parse_monto(g["saldo_pendiente"]),
@@ -964,41 +964,82 @@ class BanorteCreditParser(BankParser):
 
     def _parse_regular_section(self, lines):
         """
-        Nota: aquí se parsean solo las filas de una línea.
-        Los movimientos multi-línea (como el SPEI largo) se podrían
-        mejorar juntando líneas, pero para empezar esto ya te da
-        casi todo lo de este estado.
+        Parsea movimientos regulares manejando múltiples líneas.
+        Busca fecha de inicio y luego busca el monto en esa línea o las siguientes.
         """
         registros = []
-        buffer = []
+        current_mov = None
+
+        def flush_mov():
+            nonlocal current_mov
+            if not current_mov:
+                return
+            
+            # Procesar el movimiento acumulado
+            full_desc = " ".join(current_mov["desc_lines"]).strip()
+            monto_str = current_mov["amount_str"]
+            
+            if monto_str:
+                monto = self._parse_monto(monto_str)
+                # Determinar tipo basado en el signo en el texto (+ o -)
+                tipo = "Abono" if "-" in monto_str else "Cargo"
+                monto_abs = abs(monto)
+                
+                # Extraer fechas de la primera línea
+                fechas = current_mov["date_line"].split()[:2] # Asumimos las 2 primeras palabras son fechas
+                fecha_op = fechas[0]
+                fecha_liq = fechas[1] if len(fechas) > 1 else fecha_op
+
+                registros.append({
+                    "fecha_oper": fecha_op,
+                    "fecha_liq": fecha_liq,
+                    "descripcion": full_desc,
+                    "monto": monto_abs,
+                    "tipo": tipo,
+                    "categoria": "Regular",
+                })
+            current_mov = None
 
         for raw in lines:
             line = raw.strip()
             if not line:
                 continue
 
-            # Si matchea directamente: flush buffer previo y procesa
-            m = self.REGULAR_PATTERN.match(line)
-            if m:
-                # si había texto acumulado (caso multi-línea anterior), lo ignoramos de momento
-                buffer = []
-                g = m.groupdict()
-                monto = self._parse_monto(g["monto"])
-                signo = g["signo"]
-                tipo = "Abono" if signo == "-" else "Cargo"
-
-                registros.append({
-                    "fecha_oper": g["fecha_op"],
-                    "fecha_liq": g["fecha_cargo"],
-                    "descripcion": g["desc"],
-                    "monto": monto,
-                    "tipo": tipo,
-                    "categoria": "Regular",
-                })
-            else:
-                # Podríamos ir acumulando para mejorar SPEI, etc.
-                buffer.append(line)
-
+            # Checar si es inicio de nuevo movimiento
+            if self.REGULAR_START_PATTERN.match(line):
+                flush_mov() # Guardar el anterior
+                current_mov = {
+                    "date_line": line,
+                    "desc_lines": [],
+                    "amount_str": None
+                }
+                
+                # Buscar monto en la misma línea
+                amt = self.AMOUNT_PATTERN.search(line)
+                if amt:
+                    current_mov["amount_str"] = amt.group(0)
+                    desc_part = line.replace(amt.group(0), "")
+                    current_mov["desc_lines"].append(desc_part)
+                else:
+                    # No monto aun, todo es parte de la linea inicial (fechas + desc parcial)
+                    current_mov["desc_lines"].append(line)
+            
+            elif current_mov:
+                # Continuación de movimiento
+                # Si no tenemos monto, buscarlo
+                if not current_mov["amount_str"]:
+                    amt = self.AMOUNT_PATTERN.search(line)
+                    if amt:
+                        current_mov["amount_str"] = amt.group(0)
+                        desc_part = line.replace(amt.group(0), "")
+                        current_mov["desc_lines"].append(desc_part)
+                    else:
+                        current_mov["desc_lines"].append(line)
+                else:
+                    # Ya tenemos monto, esto es más descripción (ej. referencia, clabe)
+                    current_mov["desc_lines"].append(line)
+        
+        flush_mov() # Flush final
         return registros
 
     def extract_movements(self) -> pd.DataFrame:
@@ -1038,8 +1079,9 @@ class BanorteCreditParser(BankParser):
                 continue
 
             # Fin de secciones
+            # "Total cargos" marca el fin de la sección regular usualmente
             if l.startswith("Total cargos") or l.startswith("Total abonos") \
-               or "ATENCIÓN DE QUEJAS" in l or "Notas:" in l:
+               or "ATENCIÓN DE QUEJAS" in l:
                 flush_section()
                 en_msi, en_reg = False, False
                 continue
@@ -1068,27 +1110,637 @@ class BanorteCreditParser(BankParser):
         other_cols = [c for c in df.columns if c not in base_cols]
         return df[base_cols + other_cols]
 
+    # ==========================================
+    # VALIDACIÓN Y HEADER
+    # ==========================================
+
+    def _parse_header(self) -> dict:
+        """Extrae totales del encabezado para validación."""
+        text = self.text
         
+        def find(pattern):
+            m = re.search(pattern, text, re.IGNORECASE)
+            return m.group(1).strip() if m else None
+            
+        def money(val):
+            return self._parse_monto(val) if val else 0.0
+
+        # Buscar totales explícitos al final de la sección regular
+        # Patron más flexible: "Total cargos" seguido de signo opcional, espacio y monto
+        total_cargos_match = re.search(r"Total\s+cargos\s*[+]?\s*\$?([\d,]+\.\d{2})", text, re.IGNORECASE)
+        total_abonos_match = re.search(r"Total\s+abonos\s*[-]?\s*\$?([\d,]+\.\d{2})", text, re.IGNORECASE)
+        
+        # Buscar saldo anterior (Adeudo del periodo anterior)
+        saldo_ant_match = re.search(r"Adeudo\s+del\s+periodo\s+anterior\s*\$?([\d,]+\.\d{2})", text, re.IGNORECASE)
+        
+        # Pago para no generar intereses (puede tener superíndice 2)
+        saldo_corte_match = re.search(r"Pago\s+para\s+no\s+generar\s+intereses\s*:?\s*\d?\s*\$?([\d,]+\.\d{2})", text, re.IGNORECASE)
+
+        header = {
+            "periodo": find(r"Periodo\s*:\s*([^\n]+)"),
+            "fecha_corte": find(r"Fecha\s+de\s+corte\s*:\s*(\d{2}-[A-Z]{3}-\d{4})"),
+            "no_cuenta": self.extract_account_number(),
+            
+            # Totales
+            "saldo_anterior": money(saldo_ant_match.group(1)) if saldo_ant_match else 0.0,
+            "pagos_abonos": money(total_abonos_match.group(1)) if total_abonos_match else 0.0,
+            "compras_cargos": money(total_cargos_match.group(1)) if total_cargos_match else 0.0,
+            "saldo_actual": money(saldo_corte_match.group(1)) if saldo_corte_match else 0.0,
+        }
+        return header
+
+    def _validation_report(self, header: dict, df: pd.DataFrame, tol: float = 0.05) -> dict:
+        """Genera reporte de validación comparando totales extraídos vs header."""
+        # Filtrar solo movimientos regulares para la suma de cargos (excluir MSI informativos)
+        # Los MSI informativos tienen tipo "Cargo MSI Informativo"
+        
+        cargos_df = df[df["tipo"] == "Cargo"]
+        abonos_df = df[df["tipo"] == "Abono"]
+        
+        sum_cargos = float(cargos_df["monto"].sum()) if not cargos_df.empty else 0.0
+        sum_abonos = float(abonos_df["monto"].sum()) if not abonos_df.empty else 0.0
+        
+        resumen_cargos = header.get("compras_cargos") or 0.0
+        resumen_abonos = header.get("pagos_abonos") or 0.0
+        
+        # Validación de saldo: Saldo Anterior - Pagos + Compras = Saldo Actual
+        saldo_ant = header.get("saldo_anterior") or 0.0
+        saldo_act = header.get("saldo_actual") or 0.0
+        saldo_calc = saldo_ant - resumen_abonos + resumen_cargos
+        
+        return {
+            "tipo": "TDC",
+            "controles": {
+                "cargos_vs_resumen_ok": abs(sum_cargos - resumen_cargos) <= tol,
+                "abonos_vs_resumen_ok": abs(sum_abonos - resumen_abonos) <= tol,
+                "balance_header_ok": abs(saldo_calc - saldo_act) <= tol
+            },
+            "detalles": {
+                "sum_cargos_df": sum_cargos,
+                "resumen_cargos": resumen_cargos,
+                "diff_cargos": sum_cargos - resumen_cargos,
+                "sum_abonos_df": sum_abonos,
+                "resumen_abonos": resumen_abonos,
+                "diff_abonos": sum_abonos - resumen_abonos,
+                "saldo_anterior": saldo_ant,
+                "saldo_actual": saldo_act,
+                "saldo_calculado_header": saldo_calc
+            }
+        }
+
+    def parse(self):
+        """Ejecuta el parsing completo y retorna resultado con metadata."""
+        self.header = self._parse_header()
+        df = self.extract_movements()
+        report = self._validation_report(self.header, df)
+        
+        return {
+            "account_number": self.extract_account_number(),
+            "movements": df,
+            "metadata": {
+                "account_type": "TDC",
+                "header": self.header,
+                "validation": report
+            }
+        }
+
+    # ==========================================
+    # VALIDACIÓN Y HEADER
+    # ==========================================
+
+    def _parse_header(self) -> dict:
+        """Extrae totales del encabezado para validación."""
+        text = self.text
+        
+        def find(pattern):
+            m = re.search(pattern, text, re.IGNORECASE)
+            return m.group(1).strip() if m else None
+            
+        def money(val):
+            return self._parse_monto(val)
+
+        # Patrones comunes en Banorte (ajustar según ejemplos reales)
+        # Buscamos en las primeras líneas o en el resumen
+        
+        header = {
+            "periodo": find(r"Periodo\s*:\s*([^\n]+)"),
+            "fecha_corte": find(r"Fecha\s*de\s*Corte\s*:\s*(\d{2}-[A-Z]{3}-\d{4})"),
+            "no_cuenta": self.extract_account_number(),
+            # Resumen de saldos
+            "saldo_anterior": money(find(r"Saldo\s*Anterior\s*\$([\d,]+\.\d{2})")),
+            "pagos_abonos": money(find(r"Pagos\s*y\s*Abonos\s*[-]?\s*\$([\d,]+\.\d{2})")),
+            "compras_cargos": money(find(r"Compras\s*y\s*Cargos\s*\$([\d,]+\.\d{2})")),
+            "saldo_actual": money(find(r"Saldo\s*Actual\s*\$([\d,]+\.\d{2})")),
+        }
+        return header
+
+    def _validation_report(self, header: dict, df: pd.DataFrame, tol: float = 0.05) -> dict:
+        """Genera reporte de validación comparando totales extraídos vs header."""
+        sum_cargos = float(df[df["tipo"] == "Cargo"]["monto"].sum()) if not df.empty else 0.0
+        sum_abonos = float(df[df["tipo"] == "Abono"]["monto"].sum()) if not df.empty else 0.0
+        
+        resumen_cargos = header.get("compras_cargos") or 0.0
+        resumen_abonos = header.get("pagos_abonos") or 0.0
+        
+        # Validación de saldo: Saldo Anterior - Pagos + Compras = Saldo Actual
+        saldo_ant = header.get("saldo_anterior") or 0.0
+        saldo_act = header.get("saldo_actual") or 0.0
+        saldo_calc = saldo_ant - resumen_abonos + resumen_cargos
+        
+        return {
+            "tipo": "TDC",
+            "controles": {
+                "cargos_vs_resumen_ok": abs(sum_cargos - resumen_cargos) <= tol,
+                "abonos_vs_resumen_ok": abs(sum_abonos - resumen_abonos) <= tol,
+                "balance_header_ok": abs(saldo_calc - saldo_act) <= tol
+            },
+            "detalles": {
+                "sum_cargos_df": sum_cargos,
+                "resumen_cargos": resumen_cargos,
+                "diff_cargos": sum_cargos - resumen_cargos,
+                "sum_abonos_df": sum_abonos,
+                "resumen_abonos": resumen_abonos,
+                "diff_abonos": sum_abonos - resumen_abonos,
+                "saldo_anterior": saldo_ant,
+                "saldo_actual": saldo_act,
+                "saldo_calculado_header": saldo_calc
+            }
+        }
+
+    def parse(self):
+        """Ejecuta el parsing completo y retorna resultado con metadata."""
+        self.header = self._parse_header()
+        df = self.extract_movements()
+        report = self._validation_report(self.header, df)
+        
+        return {
+            "account_number": self.extract_account_number(),
+            "movements": df,
+            "metadata": {
+                "account_type": "TDC",
+                "header": self.header,
+                "validation": report
+            }
+        }
+
+        
+# ==========================================
+# ScotiabankV2Parser - Parser mejorado basado en main_scotia.py
+# Soporta tanto TDC (Tarjeta de Crédito) como CHECKING (Cuenta de Cheques)
+# ==========================================
+
+class ScotiabankV2Parser(BankParser):
+    """
+    Parser mejorado para estados de cuenta Scotiabank.
+    Detecta automáticamente el tipo de cuenta (TDC o CHECKING) y aplica
+    el parser correspondiente. Basado en main_scotia.py.
+    """
+    
+    # Configuración
+    MONTHS_ES = {
+        "ENE": 1, "FEB": 2, "MAR": 3, "ABR": 4, "MAY": 5, "JUN": 6,
+        "JUL": 7, "AGO": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DIC": 12,
+        "Ene": 1, "Feb": 2, "Mar": 3, "Abr": 4, "May": 5, "Jun": 6,
+        "Jul": 7, "Ago": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dic": 12
+    }
+    
+    DATE_RE = re.compile(r"^(?P<day>\d{2})\s+(?P<mon>ENE|FEB|MAR|ABR|MAY|JUN|JUL|AGO|SEP|OCT|NOV|DIC)\b", re.IGNORECASE)
+    MONEY_RE = re.compile(r"\$[\d,]+\.\d{2}")
+
+    def __init__(self, text, pdf_path=None):
+        super().__init__(text, pdf_path)
+        self.lines = self._extract_lines()
+        self.account_type = self._detect_account_type()
+        self.header = {}
+        self.validation_report = {}
+
+    def _extract_lines(self):
+        """Extrae líneas del PDF usando pdfplumber."""
+        if not self.pdf_path:
+            # Fallback: usar el texto ya extraído
+            return [ln.strip() for ln in self.text.splitlines() if ln.strip()]
+        
+        import pdfplumber
+        lines = []
+        with pdfplumber.open(self.pdf_path) as pdf:
+            for page in pdf.pages:
+                text = page.extract_text() or ""
+                for ln in text.splitlines():
+                    if ln.strip():
+                        lines.append(ln.strip())
+        return lines
+
+    def _money_to_float(self, value: str) -> float:
+        """Convierte '$301,515.28' a 301515.28"""
+        if not value:
+            return 0.0
+        return float(str(value).replace("$", "").replace(",", "").strip())
+
+    def _almost_equal(self, a, b, tol: float = 0.05) -> bool:
+        """Compara dos floats con tolerancia."""
+        if a is None or b is None:
+            return False
+        return abs(a - b) <= tol
+
+    # ==========================================
+    # DETECTOR DE TIPO DE CUENTA
+    # ==========================================
+
+    def _detect_account_type(self) -> str:
+        """Detecta si es TDC (Tarjeta de Crédito) o CHECKING (Cuenta de Cheques)."""
+        text = "\n".join(self.lines[:50]).upper()
+        
+        if re.search(r"L[ÍI]MITE\s*DE\s*CR[ÉE]DITO", text) or \
+           re.search(r"PAGO\s*M[ÍI]NIMO", text) or \
+           re.search(r"TARJETA\s*DE\s*CR[ÉE]DITO", text):
+            return "TDC"
+        
+        if re.search(r"CLABE", text) and re.search(r"SALDO\s*INICIAL", text):
+            return "CHECKING"
+            
+        return "UNKNOWN"
+
+    # ==========================================
+    # EXTRACCIÓN DE CUENTA
+    # ==========================================
+
+    def extract_account_number(self):
+        """Extrae el número de cuenta del estado."""
+        text = "\n".join(self.lines)
+        
+        # Para CHECKING: buscar "Cuenta 123456789"
+        m = re.search(r"Cuenta\s+(\d+)", text)
+        if m:
+            return m.group(1)
+        
+        # Para TDC: buscar "No. Tarjeta 1234567890"
+        m = re.search(r"No\.\s*Tarjeta\s+(\d+)", text)
+        if m:
+            return m.group(1)
+        
+        # Fallback CLABE
+        m = re.search(r"CLABE\s+(\d{18})", text)
+        if m:
+            return m.group(1)
+            
+        return "SCOTIA-UNKNOWN"
+
+    # ==========================================
+    # PARSER: CUENTA DE CHEQUES (CHECKING)
+    # ==========================================
+
+    def _parse_checking_header(self) -> dict:
+        """Extrae información del encabezado para cuentas de cheques."""
+        text = "\n".join(self.lines)
+
+        def find(pattern, flags=0):
+            m = re.search(pattern, text, flags)
+            return m.group(1).strip() if m else None
+
+        header = {
+            "cuenta": find(r"Cuenta\s+(\d+)"),
+            "clabe": find(r"CLABE\s+(\d{18})"),
+            "fecha_corte": find(r"Fechadecorte\s+([0-9]{2}-[A-Z]{3}-[0-9]{2})"),
+            "periodo": find(r"Periodo\s+([0-9]{2}-[A-Z]{3}-[0-9]{2}/[0-9]{2}-[A-Z]{3}-[0-9]{2})"),
+            "moneda": find(r"Moneda\s+([A-Z]+)"),
+            "saldo_inicial": find(r"Saldo\s*inicial(?:\s*=)?\s+\$([\d,]+\.\d{2})"),
+            "depositos": find(r"\(\+\)\s*Depósitos\s+\$([\d,]+\.\d{2})"),
+            "retiros": find(r"\(-\)\s*Retiros\s+\$([\d,]+\.\d{2})"),
+            "saldo_final": find(r"(?:\(=\)\s*)?Saldofinal(?:delacuenta)?\s*(?:=)?\s*\$([\d,]+\.\d{2})"),
+        }
+
+        for k in ["saldo_inicial", "depositos", "retiros", "saldo_final"]:
+            if header[k] is not None:
+                header[k] = self._money_to_float(header[k])
+
+        return header
+
+    def _classify_amount_checking(self, amount: float, concept: str):
+        """Clasifica un monto como depósito o retiro basado en el concepto."""
+        c = (concept or "").upper()
+        if any(w in c for w in ["PAGO", "RETIRO", "CARGO", "TRANSFERENCIA A", "COMISION", "INTERES"]):
+            return None, amount
+        if any(w in c for w in ["DEPOS", "DEPÓS", "ABONO", "NOMINA", "TRANSFERENCIA DE", "TRASPASO DE"]):
+            return amount, None
+        return None, None
+
+    def _parse_checking_movements(self, start_balance: float = None) -> pd.DataFrame:
+        """Parsea movimientos de cuenta de cheques."""
+        from datetime import datetime
+        
+        text = "\n".join(self.lines)
+        m = re.search(r"Fechadecorte\s+\d{2}-[A-Z]{3}-(\d{2})", text)
+        year = 2000 + int(m.group(1)) if m else datetime.now().year
+
+        movements = []
+        current = None
+        last_saldo = start_balance
+
+        def flush():
+            nonlocal current, last_saldo
+            if not current:
+                return
+
+            concept = " ".join(current["concept"]).strip()
+            amounts = current["amounts"]
+            deposito = retiro = monto_sin_clasificar = saldo = None
+
+            found_match = False
+            if last_saldo is not None and len(amounts) >= 2:
+                for i in range(len(amounts) - 1):
+                    pos_monto = amounts[i]
+                    pos_saldo = amounts[i+1]
+                    if abs(last_saldo - pos_monto - pos_saldo) < 0.05:
+                        retiro, saldo, found_match = pos_monto, pos_saldo, True
+                        break
+                    if abs(last_saldo + pos_monto - pos_saldo) < 0.05:
+                        deposito, saldo, found_match = pos_monto, pos_saldo, True
+                        break
+            
+            if not found_match:
+                if len(amounts) >= 2:
+                    if len(amounts) >= 3 and amounts[-1] == 0.0:
+                        monto_cand, saldo_cand = amounts[-3], amounts[-2]
+                    else:
+                        monto_cand, saldo_cand = amounts[-2], amounts[-1]
+                    
+                    saldo = saldo_cand
+                    d_heur, r_heur = self._classify_amount_checking(monto_cand, concept)
+                    if d_heur:
+                        deposito = d_heur
+                    if r_heur:
+                        retiro = r_heur
+                    if not deposito and not retiro:
+                        monto_sin_clasificar = monto_cand
+                elif len(amounts) == 1:
+                    monto_sin_clasificar = amounts[0]
+
+            if saldo is not None:
+                last_saldo = saldo
+
+            ref = None
+            refs = re.findall(r"\b\d{10,}\b", concept)
+            if refs:
+                ref = refs[0]
+
+            movements.append({
+                "fecha": current["fecha"],
+                "concepto": concept,
+                "referencia": ref,
+                "deposito": deposito,
+                "retiro": retiro,
+                "monto_sin_clasificar": monto_sin_clasificar,
+                "saldo": saldo
+            })
+            current = None
+
+        for ln in self.lines:
+            up = ln.upper()
+            if up.startswith(("DETALLE DE TUS MOVIMIENTOS", "FECHA CONCEPTO", "PAGINA", "SCOTIABANK")):
+                continue
+
+            md = self.DATE_RE.match(ln)
+            if md:
+                flush()
+                try:
+                    fecha = datetime(year, self.MONTHS_ES[md.group("mon").upper()], int(md.group("day"))).date().isoformat()
+                except:
+                    fecha = ln.split()[0]
+                
+                current = {
+                    "fecha": fecha,
+                    "concept": [ln],
+                    "amounts": [self._money_to_float(x) for x in self.MONEY_RE.findall(ln)]
+                }
+            else:
+                if current:
+                    current["concept"].append(ln)
+                    current["amounts"].extend(self._money_to_float(x) for x in self.MONEY_RE.findall(ln))
+
+        flush()
+        return pd.DataFrame(movements)
+
+    def _validation_report_checking(self, header: dict, df: pd.DataFrame, tol: float = 0.02) -> dict:
+        """Genera reporte de validación para cuenta de cheques."""
+        sum_dep = float(df["deposito"].fillna(0).sum()) if "deposito" in df else 0.0
+        sum_ret = float(df["retiro"].fillna(0).sum()) if "retiro" in df else 0.0
+        
+        saldo_inicial = header.get("saldo_inicial") or 0.0
+        dep_resumen = header.get("depositos") or 0.0
+        ret_resumen = header.get("retiros") or 0.0
+        saldo_final = header.get("saldo_final") or 0.0
+
+        expected_final = saldo_inicial + dep_resumen - ret_resumen
+        
+        last_saldo = None
+        if "saldo" in df.columns and df["saldo"].notna().any():
+            last_saldo = float(df.loc[df["saldo"].notna(), "saldo"].iloc[-1])
+
+        return {
+            "tipo": "CHECKING",
+            "controles": {
+                "depositos_ok": self._almost_equal(sum_dep, dep_resumen, tol),
+                "retiros_ok": self._almost_equal(sum_ret, ret_resumen, tol),
+                "saldo_final_calc_ok": self._almost_equal(expected_final, saldo_final, tol),
+                "saldo_final_df_ok": self._almost_equal(last_saldo, saldo_final, tol)
+            },
+            "detalles": {
+                "sum_dep_df": sum_dep,
+                "sum_ret_df": sum_ret,
+                "dep_resumen": dep_resumen,
+                "ret_resumen": ret_resumen,
+                "diff_dep": sum_dep - dep_resumen,
+                "diff_ret": sum_ret - ret_resumen
+            }
+        }
+
+    # ==========================================
+    # PARSER: TARJETA DE CRÉDITO (TDC)
+    # ==========================================
+
+    def _parse_tdc_header(self) -> dict:
+        """Extrae información del encabezado para tarjeta de crédito."""
+        text = "\n".join(self.lines[:100])  # Resumen suele estar al principio
+        full_text = "\n".join(self.lines)   # Para buscar totales que pueden estar más abajo
+        
+        def find(pattern, search_text=text):
+            m = re.search(pattern, search_text, re.IGNORECASE)
+            return m.group(1).strip() if m else None
+
+        pagos_abonos = find(r"Pagos\s*y\s*abonos\s*[-–]?\s*\$([\d,]+\.\d{2})")
+        cargos_regulares = find(r"Cargos\s*regulares.*?\+\s*\$([\d,]+\.\d{2})")
+        cargos_meses = find(r"Cargos.*?\s*meses.*?\+\s*\$([\d,]+\.\d{2})")
+        
+        # Buscar totales en todo el documento
+        total_cargos_final = find(r"Total\s*cargos\s*\+\s*\$([\d,]+\.\d{2})", full_text) or "0"
+        total_abonos_final = find(r"Total\s*abonos\s*[-–]?\s*\$([\d,]+\.\d{2})", full_text) or "0"
+        
+        header = {
+            "periodo": find(r"Periodo:\s*([^\n]+)"),
+            "fecha_corte": find(r"Fecha\s*de\s*corte:\s*(\d{2}-[a-z]{3}-\d{4})"),
+            "no_tarjeta": find(r"No\.\s*Tarjeta\s*(\d+)"),
+            "saldo_deudor_total": find(r"Saldo\s*deudor\s*total:\s*\$([\d,]+\.\d{2})"),
+            "pago_no_intereses": find(r"Pago\s*para\s*no\s*generar\s*intereses:\s*\d*\s*\$([\d,]+\.\d{2})"),
+            "resumen_pagos_abonos": self._money_to_float(pagos_abonos or total_abonos_final),
+            "resumen_cargos_total": self._money_to_float(total_cargos_final)
+        }
+        
+        if header["resumen_cargos_total"] == 0:
+            c1 = self._money_to_float(cargos_regulares)
+            c2 = self._money_to_float(cargos_meses)
+            header["resumen_cargos_total"] = c1 + c2
+
+        return header
+
+    def _parse_tdc_movements(self) -> pd.DataFrame:
+        """Parsea movimientos de tarjeta de crédito."""
+        movements = []
+        capture = False
+        
+        # Regex más flexible para línea de movimiento TDC
+        mv_re = re.compile(
+            r"^(?P<f_ops>\d{2}-[a-z]{3}-\d{4})\s+(?P<f_carg>\d{2}-[a-z]{3}-\d{4})\s+(?P<desc>.+?)\s*(?P<signo>[-+])\s*\$(?P<monto>[\d,]+\.\d{2})$",
+            re.IGNORECASE
+        )
+
+        for ln in self.lines:
+            # Detección de sección robusta (ignorar espacios internos que pdfplumber a veces elimina)
+            normalized_ln = ln.upper().replace(" ", "")
+            
+            if "CARGOS,ABONOSYCOMPRASREGULARES" in normalized_ln:
+                capture = True
+                continue
+            
+            # Fin de sección: "ATENCIÓN DE QUEJAS" suele estar al final
+            if "ATENCIÓN" in normalized_ln and "QUEJAS" in normalized_ln:
+                capture = False
+            
+            if not capture:
+                continue
+            
+            # Filtro rápido: debe empezar con número (fecha) y tener $
+            if not ln or not ln[0].isdigit() or "$" not in ln:
+                continue
+                
+            m = mv_re.match(ln)
+            if m:
+                d = m.groupdict()
+                monto = self._money_to_float(d["monto"])
+                signo = d["signo"]
+                tipo = "Abono" if signo == "-" else "Cargo"
+                
+                movements.append({
+                    "fecha_operacion": d["f_ops"],
+                    "fecha_cargo": d["f_carg"],
+                    "descripcion": d["desc"].strip(),
+                    "monto": monto,
+                    "tipo": tipo,
+                    "abono": monto if tipo == "Abono" else None,
+                    "cargo": monto if tipo == "Cargo" else None
+                })
+
+        return pd.DataFrame(movements)
+
+    def _validation_report_tdc(self, header: dict, df: pd.DataFrame, tol: float = 0.05) -> dict:
+        """Genera reporte de validación para tarjeta de crédito."""
+        sum_cargos = float(df["cargo"].fillna(0).sum()) if "cargo" in df.columns else 0.0
+        sum_abonos = float(df["abono"].fillna(0).sum()) if "abono" in df.columns else 0.0
+        
+        resumen_cargos = header.get("resumen_cargos_total") or 0.0
+        resumen_abonos = header.get("resumen_pagos_abonos") or 0.0
+
+        return {
+            "tipo": "TDC",
+            "controles": {
+                "cargos_vs_resumen_ok": self._almost_equal(sum_cargos, resumen_cargos, tol),
+                "abonos_vs_resumen_ok": self._almost_equal(sum_abonos, resumen_abonos, tol),
+            },
+            "detalles": {
+                "sum_cargos_df": sum_cargos,
+                "resumen_cargos": resumen_cargos,
+                "diff_cargos": sum_cargos - resumen_cargos,
+                "sum_abonos_df": sum_abonos,
+                "resumen_abonos": resumen_abonos,
+                "diff_abonos": sum_abonos - resumen_abonos,
+            }
+        }
+
+    # ==========================================
+    # API PÚBLICA: extract_movements y parse
+    # ==========================================
+
+    def extract_movements(self) -> pd.DataFrame:
+        """Extrae movimientos según el tipo de cuenta detectado."""
+        if self.account_type == "CHECKING":
+            self.header = self._parse_checking_header()
+            df_raw = self._parse_checking_movements(start_balance=self.header.get("saldo_inicial"))
+            self.validation_report = self._validation_report_checking(self.header, df_raw)
+            
+            # Normalizar a formato estándar
+            registros = []
+            for _, row in df_raw.iterrows():
+                monto = row.get("deposito") or row.get("retiro") or row.get("monto_sin_clasificar") or 0.0
+                tipo = "Abono" if row.get("deposito") else ("Cargo" if row.get("retiro") else "Desconocido")
+                
+                registros.append({
+                    "fecha_oper": row.get("fecha"),
+                    "fecha_liq": row.get("fecha"),
+                    "descripcion": row.get("concepto", ""),
+                    "monto": monto,
+                    "tipo": tipo,
+                    "categoria": "Regular",
+                    "saldo_calculado": row.get("saldo"),
+                })
+            return pd.DataFrame(registros)
+            
+        elif self.account_type == "TDC":
+            self.header = self._parse_tdc_header()
+            df_raw = self._parse_tdc_movements()
+            self.validation_report = self._validation_report_tdc(self.header, df_raw)
+            
+            # Normalizar a formato estándar
+            registros = []
+            for _, row in df_raw.iterrows():
+                registros.append({
+                    "fecha_oper": row.get("fecha_operacion"),
+                    "fecha_liq": row.get("fecha_cargo"),
+                    "descripcion": row.get("descripcion", ""),
+                    "monto": row.get("monto", 0.0),
+                    "tipo": row.get("tipo", "Desconocido"),
+                    "categoria": "Regular",
+                    "saldo_calculado": None,
+                })
+            return pd.DataFrame(registros)
+        else:
+            print(f"Tipo de cuenta no soportado: {self.account_type}")
+            return pd.DataFrame()
+
+    def parse(self):
+        """Ejecuta el parsing completo y retorna resultado con metadata."""
+        result = super().parse()
+        result["metadata"] = {
+            "account_type": self.account_type,
+            "header": self.header,
+            "validation": self.validation_report
+        }
+        return result
+
+
 def get_parser(text, pdf_path=None):
     """Factory function to determine the correct parser based on text content."""
     text_upper = text.upper()
     
-    # Check Scotiabank first (as it might contain 'BBVA' in transactions)
+    # Check Scotiabank first - usar el nuevo parser V2 por defecto
     if "SCOTIABANK" in text_upper or "DISTRIBUCIÓN DE TU ÚLTIMO PAGO" in text_upper or "COMPRAS Y CARGOS DIFERIDOS" in text_upper or "DETALLE DE TUS MOVIMIENTOS" in text_upper:
-        # Distinguish Credit vs Debit
-        # Credit usually has "COMPRAS Y CARGOS DIFERIDOS"
-        # Debit has "DETALLE DE TUS MOVIMIENTOS" and "DEPOSITO" / "RETIRO" columns
-        if "DETALLE DE TUS MOVIMIENTOS" in text_upper:
-             return ScotiabankDebitParser(text, pdf_path)
-        return ScotiabankCreditParser(text, pdf_path)
+        # Usar ScotiabankV2Parser que detecta automáticamente TDC vs CHECKING
+        return ScotiabankV2Parser(text, pdf_path)
         
     elif "BBVA" in text_upper:
-        if "DETALLE DE MOVIMIENTOS REALIZADOS" in text_upper: # Strong indicator for the debit format we have
+        if "DETALLE DE MOVIMIENTOS REALIZADOS" in text_upper:
             return BBVADebitParser(text, pdf_path)
         return BBVACreditParser(text, pdf_path)
         
     elif "BANORTE" in text_upper:
-        return BanorteParser(text, pdf_path)
+        return BanorteCreditParser(text, pdf_path)
     
-    # Default fallback or error
     return None

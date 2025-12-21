@@ -23,8 +23,6 @@ def init_db():
             saldo_calculado REAL,
             meta_monto_original REAL,
             meta_saldo_pendiente REAL,
-            meta_monto_original REAL,
-            meta_saldo_pendiente REAL,
             user_classification TEXT,
             recurrence_period TEXT,
             UNIQUE(account_number, fecha_oper, descripcion, monto, tipo)
@@ -61,7 +59,6 @@ def save_movements(df, account_number, bank_name):
                 INSERT OR IGNORE INTO movements (
                     account_number, bank, fecha_oper, fecha_liq, descripcion, 
                     monto, tipo, categoria, saldo_calculado, 
-                    monto, tipo, categoria, saldo_calculado, 
                     meta_monto_original, meta_saldo_pendiente, user_classification, recurrence_period
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
@@ -76,8 +73,8 @@ def save_movements(df, account_number, bank_name):
                 row["saldo_calculado"],
                 row["meta_monto_original"],
                 row["meta_saldo_pendiente"],
-                None, # user_classification default
-                None  # recurrence_period default
+                None,  # user_classification default
+                None   # recurrence_period default
             ))
         except Exception as e:
             print(f"Error saving row: {e}")

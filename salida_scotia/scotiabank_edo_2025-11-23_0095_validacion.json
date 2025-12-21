@@ -1,0 +1,15 @@
+{
+  "tipo": "TDC",
+  "controles": {
+    "cargos_vs_resumen_ok": true,
+    "abonos_vs_resumen_ok": true
+  },
+  "detalles": {
+    "sum_cargos_df": 18365.760000000002,
+    "resumen_cargos": 18365.76,
+    "diff_cargos": 3.637978807091713e-12,
+    "sum_abonos_df": 11349.99,
+    "resumen_abonos": 11349.99,
+    "diff_abonos": 0.0
+  }
+}

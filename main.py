@@ -2,7 +2,7 @@ import pdfplumber
 import sys
 import argparse
 from pathlib import Path
-from parsers import get_parser
+from parsers import get_parser, ScotiabankV2Parser
 import database
 
 def leer_pdf(ruta):
@@ -19,6 +19,8 @@ if __name__ == "__main__":
     
     parser_arg = argparse.ArgumentParser(description="Parse bank statements.")
     parser_arg.add_argument("file", nargs="?", default="file.pdf", help="Path to the PDF file")
+    parser_arg.add_argument("--parser", choices=["auto", "scotiabank-v2"], default="auto", 
+                           help="Parser to use (default: auto)")
     args = parser_arg.parse_args()
     
     ruta_pdf = Path(args.file)
@@ -29,10 +31,11 @@ if __name__ == "__main__":
         print(f"Procesando: {ruta_pdf}")
         texto = leer_pdf(ruta_pdf)
         
-        # Debug: Print first 500 chars to see what we are dealing with if needed
-        # print(f"--- Inicio del texto ---\n{texto[:500]}\n--- Fin del texto ---")
-        
-        parser = get_parser(texto, pdf_path=ruta_pdf)
+        # Seleccionar parser
+        if args.parser == "scotiabank-v2":
+            parser = ScotiabankV2Parser(texto, pdf_path=ruta_pdf)
+        else:
+            parser = get_parser(texto, pdf_path=ruta_pdf)
         
         if parser:
             parser_name = type(parser).__name__
@@ -46,6 +49,25 @@ if __name__ == "__main__":
                 print(f"Cuenta detectada: {account_number}")
                 print(f"Movimientos encontrados: {len(df_movements)}")
                 print(df_movements.head())
+                
+                # Mostrar validación si está disponible (ScotiabankV2Parser)
+                if "metadata" in resultado:
+                    meta = resultado["metadata"]
+                    print(f"\n--- Tipo de cuenta: {meta.get('account_type', 'N/A')} ---")
+                    
+                    validation = meta.get("validation", {})
+                    if validation:
+                        print("\nValidación:")
+                        controles = validation.get("controles", {})
+                        for ctrl, ok in controles.items():
+                            icon = "✅" if ok else "❌"
+                            print(f"  {icon} {ctrl}")
+                        
+                        detalles = validation.get("detalles", {})
+                        if detalles:
+                            print("\nDetalles:")
+                            for key, val in detalles.items():
+                                print(f"  {key}: {val}")
                 
                 # Determine Bank Name from parser name
                 bank_name = "Desconocido"

@@ -9,8 +9,15 @@ import os
 
 # Import local modules
 # Import parsers explicitly
-from parsers import get_parser, BBVADebitParser, BBVACreditParser, ScotiabankCreditParser, ScotiabankDebitParser, BanorteCreditParser
-from parsers import get_parser, BBVADebitParser, BBVACreditParser, ScotiabankCreditParser, ScotiabankDebitParser, BanorteCreditParser
+from parsers import (
+    get_parser, 
+    BBVADebitParser, 
+    BBVACreditParser, 
+    ScotiabankCreditParser, 
+    ScotiabankDebitParser, 
+    BanorteCreditParser,
+    ScotiabankV2Parser  # Nuevo parser mejorado
+)
 from ai_parsers import OpenAIVisionParser, NemotronParser, LocalNemotronParser, GeminiVisionParser, AIBankParser
 
 
@@ -24,6 +31,7 @@ PARSERS_MAP = {
     "BBVA Crédito": BBVACreditParser,
     "Scotiabank Crédito": ScotiabankCreditParser,
     "Scotiabank Débito": ScotiabankDebitParser,
+    "Scotiabank V2 (Mejorado)": ScotiabankV2Parser,  # Nuevo parser que detecta TDC/Checking automáticamente
     "Banorte Crédito": BanorteCreditParser,
     "Scotiabank - OpenAI Vision": OpenAIVisionParser,
     "Scotiabank - Gemini 1.5 Pro": GeminiVisionParser,
@@ -109,14 +117,50 @@ def process_pdf(uploaded_file, manual_parser_name=None):
                 account_number = resultado["account_number"]
                 df_movements = resultado["movements"]
                 
-                # Validation Logic
-                # We need to extract metadata for validation if available
-                # AIBankParser might return metadata in 'movements' or separate?
-                # The parse() method in BankParser returns dict with 'movements' (DF).
-                # We should probably update parse() or the extractors to return more data.
-                # For now, let's assume we can get validation info if it's an AI parser.
+                # Validación para ScotiabankV2Parser y BanorteCreditParser
+                if isinstance(parser_instance, (ScotiabankV2Parser, BanorteCreditParser)):
+                    meta = resultado.get("metadata", {})
+                    if meta:
+                        st.subheader(f"📊 Validación - {meta.get('account_type', 'Desconocido')}")
+                        
+                        # Mostrar header info
+                        header = meta.get("header", {})
+                        validation = meta.get("validation", {})
+                        
+                        if meta.get("account_type") == "CHECKING":
+                            col1, col2, col3, col4 = st.columns(4)
+                            col1.metric("Saldo Inicial", f"${header.get('saldo_inicial', 0):,.2f}")
+                            col2.metric("Depósitos", f"${header.get('depositos', 0):,.2f}")
+                            col3.metric("Retiros", f"${header.get('retiros', 0):,.2f}")
+                            col4.metric("Saldo Final", f"${header.get('saldo_final', 0):,.2f}")
+                        elif meta.get("account_type") == "TDC":
+                            col1, col2, col3 = st.columns(3)
+                            col1.metric("Período", header.get("periodo", "N/A"))
+                            
+                            # Unificar claves de diferentes parsers
+                            cargos = header.get('resumen_cargos_total') or header.get('compras_cargos') or 0
+                            abonos = header.get('resumen_pagos_abonos') or header.get('pagos_abonos') or 0
+                            
+                            col2.metric("Total Cargos", f"${cargos:,.2f}")
+                            col3.metric("Pagos/Abonos", f"${abonos:,.2f}")
+                        
+                        # Mostrar validación
+                        controles = validation.get("controles", {})
+                        if controles:
+                            all_ok = all(controles.values())
+                            if all_ok:
+                                st.success("✅ Validación Correcta: Todos los controles pasaron.")
+                            else:
+                                st.warning("⚠️ Validación con discrepancias:")
+                                for ctrl, ok in controles.items():
+                                    icon = "✅" if ok else "❌"
+                                    st.write(f"  {icon} {ctrl}")
+                            
+                            with st.expander("Ver detalles de validación"):
+                                st.json(validation)
                 
-                if isinstance(parser_instance, AIBankParser):
+                # Validación para AIBankParser (parsers con IA)
+                elif isinstance(parser_instance, AIBankParser):
                     meta = resultado.get("metadata", {})
                     if meta:
                         st.subheader("Validación de Extracción (AI)")
@@ -136,13 +180,14 @@ def process_pdf(uploaded_file, manual_parser_name=None):
                                 float(meta.get('total_cargos') or 0)
                             )
 
-                            
                             if val_res["valid"]:
                                 st.success("✅ Validación Correcta: El balance coincide.")
                             else:
                                 st.error("❌ Validación Fallida: Discrepancia en balance.")
                                 st.write(f"Diferencia: ${val_res.get('diff', 0):,.2f}")
                                 st.json(val_res)
+                        except Exception as e:
+                            st.warning(f"No se pudo validar automáticamente: {e}")
                             
                     # Display Informative Data
                     info_data = resultado.get("informative_data", [])
@@ -151,9 +196,9 @@ def process_pdf(uploaded_file, manual_parser_name=None):
                         st.write("Se detectaron tablas informativas (ej. Saldo Pendiente):")
                         st.json(info_data)
 
-                        except Exception as e:
-                            st.warning(f"No se pudo validar automáticamente: {e}")
-
+                # Mostrar preview de movimientos
+                st.subheader(f"📋 Preview: {len(df_movements)} movimientos encontrados")
+                st.dataframe(df_movements.head(10))
 
                 # Determine Bank Name
                 bank_name = "Desconocido"
@@ -165,17 +210,18 @@ def process_pdf(uploaded_file, manual_parser_name=None):
                 elif "Banorte" in p_name:
                     bank_name = "Banorte"
                 elif "OpenAI" in p_name or "Nemotron" in p_name:
-                    # Assume Scotiabank as requested, or detect?
-                    # The user specifically asked for Scotiabank extraction.
                     bank_name = "Scotiabank"
                 
                 # Save to DB
                 database.save_movements(df_movements, account_number, bank_name)
-                st.success(f"Procesado exitosamente! {len(df_movements)} movimientos guardados.")
+                st.success(f"✅ Procesado exitosamente! {len(df_movements)} movimientos guardados.")
                 return True
                 
             except Exception as e:
                 st.error(f"Error parseando el archivo: {e}")
+                import traceback
+                with st.expander("Ver detalle del error"):
+                    st.code(traceback.format_exc())
                 return False
         else:
 
