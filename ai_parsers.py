@@ -20,8 +20,8 @@ except ImportError:
 class AIBankParser(BankParser):
     """Base class for AI-powered bank parsers."""
     
-    def __init__(self, text, pdf_path=None, api_key=None):
-        super().__init__(text, pdf_path)
+    def __init__(self, text, pdf_path=None, api_key=None, month_context=None):
+        super().__init__(text, pdf_path, month_context=month_context)
         self.api_key = api_key
 
     def _pdf_to_images(self):
@@ -52,10 +52,7 @@ class AIBankParser(BankParser):
     def parse(self):
         """Runs the full parsing process and returns a dict with metadata and movements."""
         movements_df = self.extract_movements()
-        
-        # Extract metadata if available (it might be attached to the instance or last result)
-        # In our implementation of extract_movements, we didn't store the metadata yet.
-        # We need to modify extract_movements to return metadata too, or store it in self.
+        movements_df = self._normalize_movements(movements_df) # Normalize dates
         
         return {
             "account_number": self.extract_account_number(),
@@ -100,8 +97,8 @@ class AIBankParser(BankParser):
 class OpenAIVisionParser(AIBankParser):
     """Parser using OpenAI GPT-4o Vision."""
     
-    def __init__(self, text, pdf_path=None, api_key=None):
-        super().__init__(text, pdf_path, api_key)
+    def __init__(self, text, pdf_path=None, api_key=None, month_context=None):
+        super().__init__(text, pdf_path, api_key, month_context=month_context)
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
 
     def extract_account_number(self):
@@ -324,8 +321,8 @@ class OpenAIVisionParser(AIBankParser):
 class NemotronParser(AIBankParser):
     """Parser using Nvidia Nemotron via Hugging Face Inference API."""
     
-    def __init__(self, text, pdf_path=None, api_key=None):
-        super().__init__(text, pdf_path, api_key)
+    def __init__(self, text, pdf_path=None, api_key=None, month_context=None):
+        super().__init__(text, pdf_path, api_key, month_context=month_context)
         self.api_key = api_key or os.getenv("HUGGINGFACE_API_TOKEN")
 
     def extract_account_number(self):
@@ -446,8 +443,8 @@ class NemotronParser(AIBankParser):
 class LocalNemotronParser(AIBankParser):
     """Parser using local Nvidia Nemotron OCR (requires GPU and nemotron-ocr package)."""
     
-    def __init__(self, text, pdf_path=None, api_key=None):
-        super().__init__(text, pdf_path, api_key)
+    def __init__(self, text, pdf_path=None, api_key=None, month_context=None):
+        super().__init__(text, pdf_path, api_key, month_context=month_context)
         # No API key needed for local, but we need the package
 
     def extract_account_number(self):
@@ -538,8 +535,8 @@ class LocalNemotronParser(AIBankParser):
 class GeminiVisionParser(AIBankParser):
     """Parser using Google Gemini 1.5 Pro Vision (via google-genai SDK)."""
     
-    def __init__(self, text, pdf_path=None, api_key=None):
-        super().__init__(text, pdf_path, api_key)
+    def __init__(self, text, pdf_path=None, api_key=None, month_context=None):
+        super().__init__(text, pdf_path, api_key, month_context=month_context)
         self.api_key = api_key or os.getenv("GEMINI_API_KEY")
 
     def extract_account_number(self):

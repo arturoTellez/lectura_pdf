@@ -117,8 +117,8 @@ def process_pdf(uploaded_file, manual_parser_name=None):
                 account_number = resultado["account_number"]
                 df_movements = resultado["movements"]
                 
-                # Validación para ScotiabankV2Parser y BanorteCreditParser
-                if isinstance(parser_instance, (ScotiabankV2Parser, BanorteCreditParser)):
+                # Validación para ScotiabankV2Parser, BanorteCreditParser y BBVA
+                if isinstance(parser_instance, (ScotiabankV2Parser, BanorteCreditParser, BBVADebitParser, BBVACreditParser)):
                     meta = resultado.get("metadata", {})
                     if meta:
                         st.subheader(f"📊 Validación - {meta.get('account_type', 'Desconocido')}")

@@ -11,9 +11,67 @@ from abc import ABC, abstractmethod
 class BankParser(ABC):
     """Abstract base class for bank statement parsers."""
 
-    def __init__(self, text, pdf_path=None):
+    def __init__(self, text, pdf_path=None, month_context=None):
         self.text = text
         self.pdf_path = pdf_path
+        self.month_context = month_context # e.g., 'dic-2025' or '12-2025'
+        self.year_context = self._extract_year_from_context()
+
+    def _extract_year_from_context(self):
+        if not self.month_context:
+            import datetime
+            return str(datetime.datetime.now().year)
+        # Try to find a 4-digit year in month_context
+        match = re.search(r"\d{4}", self.month_context)
+        if match:
+            return match.group(0)
+        return str(datetime.datetime.now().year)
+
+    def normalize_date(self, date_str):
+        """Standardizes various date formats to DD-mmm-YYYY."""
+        if not date_str:
+            return None
+        
+        # Mapping for Spanish months
+        months_map = {
+            'ENE': 'ene', 'FEB': 'feb', 'MAR': 'mar', 'ABR': 'abr', 'MAY': 'may', 'JUN': 'jun',
+            'JUL': 'jul', 'AGO': 'ago', 'SEP': 'sep', 'OCT': 'oct', 'NOV': 'nov', 'DIC': 'dic'
+        }
+        month_names = list(months_map.values())
+        
+        # Cleanup
+        d = date_str.strip().upper().replace('/', '-')
+        
+        # 1. Matches DD-MMM-YYYY (e.g., 02-DIC-2025)
+        m1 = re.match(r"(\d{2})[- ]([A-Z]{3})[- ](\d{4})", d)
+        if m1:
+            day, mon, year = m1.groups()
+            return f"{day}-{months_map.get(mon, mon.lower())}-{year}"
+            
+        # 2. Matches DD-MMM (e.g., 02-DIC or 02/DIC) - text month without year
+        m2 = re.match(r"(\d{2})[- ]([A-Z]{3})$", d)
+        if m2:
+            day, mon = m2.groups()
+            return f"{day}-{months_map.get(mon, mon.lower())}-{self.year_context}"
+
+        # 3. Matches DD-MM-YYYY (numeric month with year)
+        m3 = re.match(r"(\d{2})-(\d{2})-(\d{4})", d)
+        if m3:
+            day, mon_num, year = m3.groups()
+            mon_idx = int(mon_num) - 1
+            if 0 <= mon_idx < 12:
+                return f"{day}-{month_names[mon_idx]}-{year}"
+        
+        # 4. Matches DD-MM (numeric month without year, e.g., 23-09)
+        m4 = re.match(r"(\d{2})-(\d{2})$", d)
+        if m4:
+            day, mon_num = m4.groups()
+            mon_idx = int(mon_num) - 1
+            if 0 <= mon_idx < 12:
+                return f"{day}-{month_names[mon_idx]}-{self.year_context}"
+
+        # Default fallback (return as is but lowered)
+        return d.lower()
 
     @abstractmethod
     def extract_account_number(self):
@@ -25,11 +83,23 @@ class BankParser(ABC):
         """Extracts movements and returns a DataFrame."""
         pass
 
+    def _normalize_movements(self, df):
+        """Final pass to ensure all dates are normalized in the resulting DataFrame."""
+        if df.empty:
+            return df
+        if "fecha_oper" in df.columns:
+            df["fecha_oper"] = df["fecha_oper"].apply(self.normalize_date)
+        if "fecha_liq" in df.columns:
+            df["fecha_liq"] = df["fecha_liq"].apply(self.normalize_date)
+        return df
+
     def parse(self):
         """Runs the full parsing process and returns a dict with metadata and movements."""
+        df = self.extract_movements()
+        df = self._normalize_movements(df)
         return {
             "account_number": self.extract_account_number(),
-            "movements": self.extract_movements()
+            "movements": df
         }
 
 
@@ -193,6 +263,108 @@ class BBVADebitParser(BankParser):
 
         return pd.DataFrame(registros)
 
+    def _parse_header(self) -> dict:
+        """Extrae totales del encabezado para validación."""
+        text = self.text
+        
+        def find_money(pattern):
+            m = re.search(pattern, text, re.IGNORECASE)
+            return float(m.group(1).replace(",", "")) if m else 0.0
+
+        def find_money_multi(patterns):
+            for pat in patterns:
+                val = find_money(pat)
+                if val != 0.0:
+                    return val
+            return 0.0
+
+        # Saldo Anterior
+        saldo_anterior = find_money_multi([
+            r"Saldo Anterior\s+\$?([\d,]+\.\d{2})",
+            r"Saldo\s+anterior\s*:\s*\$?([\d,]+\.\d{2})",
+            r"Saldo\s+Inicial\s+\$?([\d,]+\.\d{2})"
+        ])
+        
+        # Depósitos / Abonos
+        depositos = find_money_multi([
+            r"Depósitos / Abonos \(\+\)\s+\d+\s+([\d,]+\.\d{2})",
+            r"Depósitos\s*/\s*Abonos\s*\(\+\)\s*\d*\s*\$?([\d,]+\.\d{2})"
+        ])
+        
+        # Retiros / Cargos
+        retiros = find_money_multi([
+            r"Retiros / Cargos \(\-\)\s+\d+\s+([\d,]+\.\d{2})",
+            r"Retiros\s*/\s*Cargos\s*\(\-\)\s*\d*\s*\$?([\d,]+\.\d{2})"
+        ])
+        
+        # Saldo Actual / Saldo Final
+        saldo_actual = find_money_multi([
+            r"Saldo Final\s+\$?([\d,]+\.\d{2})",
+            r"Saldo Actual\s+\$?([\d,]+\.\d{2})",
+            r"Nuevo\s+Saldo\s+\$?([\d,]+\.\d{2})",
+            r"Saldo\s+al\s+corte\s+\$?([\d,]+\.\d{2})"
+        ])
+        
+        # Periodo
+        periodo_match = re.search(r"Periodo\s+Del\s+(\d{2}/\d{2}/\d{4})\s+al\s+(\d{2}/\d{2}/\d{4})", text, re.IGNORECASE)
+        periodo = f"{periodo_match.group(1)} - {periodo_match.group(2)}" if periodo_match else None
+
+        return {
+            "periodo": periodo,
+            "no_cuenta": self.extract_account_number(),
+            "saldo_inicial": saldo_anterior,
+            "depositos": depositos,
+            "retiros": retiros,
+            "saldo_final": saldo_actual
+        }
+
+    def _validation_report(self, header: dict, df: pd.DataFrame, tol: float = 0.05) -> dict:
+        sum_depositos = float(df[df["tipo"] == "Abono"]["monto"].sum()) if not df.empty else 0.0
+        sum_retiros = float(df[df["tipo"] == "Cargo"]["monto"].sum()) if not df.empty else 0.0
+        
+        resumen_depositos = header.get("depositos") or 0.0
+        resumen_retiros = header.get("retiros") or 0.0
+        
+        saldo_ini = header.get("saldo_inicial") or 0.0
+        saldo_fin = header.get("saldo_final") or 0.0
+        saldo_calc = saldo_ini + resumen_depositos - resumen_retiros
+        
+        return {
+            "tipo": "CHECKING",
+            "controles": {
+                "depositos_vs_resumen_ok": abs(sum_depositos - resumen_depositos) <= tol,
+                "retiros_vs_resumen_ok": abs(sum_retiros - resumen_retiros) <= tol,
+                "balance_header_ok": abs(saldo_calc - saldo_fin) <= tol
+            },
+            "detalles": {
+                "sum_depositos_df": sum_depositos,
+                "resumen_depositos": resumen_depositos,
+                "diff_depositos": sum_depositos - resumen_depositos,
+                "sum_retiros_df": sum_retiros,
+                "resumen_retiros": resumen_retiros,
+                "diff_retiros": sum_retiros - resumen_retiros,
+                "saldo_inicial": saldo_ini,
+                "saldo_final": saldo_fin,
+                "saldo_calculado_header": saldo_calc
+            }
+        }
+
+    def parse(self):
+        self.header = self._parse_header()
+        df = self.extract_movements()
+        df = self._normalize_movements(df)  # Ensure dates are normalized
+        report = self._validation_report(self.header, df)
+        
+        return {
+            "account_number": self.extract_account_number(),
+            "movements": df,
+            "metadata": {
+                "account_type": "CHECKING",
+                "header": self.header,
+                "validation": report
+            }
+        }
+
 
 class BBVACreditParser(BankParser):
     """Parser for BBVA Credit account statements."""
@@ -307,48 +479,159 @@ class BBVACreditParser(BankParser):
                         signo = 1 if data["signo"] == "+" else -1
                         monto_con_signo = signo * monto
                         
-                        tipo = "Abono" if signo == 1 else "Cargo" # + is Abono (Payment to card), - is Cargo (Purchase) usually in Credit Cards?
-                        # Wait, in BBVA Credit:
-                        # "STR*DALEFON + $220.00" -> This looks like a refund or payment?
-                        # "BMOVIL.PAGO TDC - $7,643.10" -> Payment to card is usually a credit (Abono).
-                        # Let's check the user's script logic:
-                        # signo = 1 if data["signo"] == "+" else -1
-                        # It doesn't explicitly say "Cargo" or "Abono".
-                        # Usually:
-                        # - (Negative) is a Charge (Debt increases? Or Debt decreases?)
-                        # Actually in credit cards:
-                        # Purchases are positive (add to debt) or negative?
-                        # Let's look at the user's example:
-                        # "BMOVIL.PAGO TDC - $7,643.10" -> Payment TO the card. This reduces debt.
-                        # "STR*DALEFON + $220.00" -> This might be a purchase? Or a refund?
-                        # Let's stick to the sign for now.
+                        # Detectar si es una cuota MSI duplicada (patrón "XX DE XX" al inicio)
+                        # o si es una compra a meses (contiene "A XX MESES" o "MESES S/I")
+                        desc = data["descripcion"]
+                        is_msi_payment = re.match(r"^\d{2}\s+DE\s+\d{2}\s+", desc)
+                        is_msi_purchase = re.search(r"A\s+\d{2}\s+MESES|MESES\s+S/I", desc, re.IGNORECASE)
+                        
+                        # Si es cuota MSI o compra a meses, marcarla para no duplicar
+                        if is_msi_payment or is_msi_purchase:
+                            categoria = "MSI_CUOTA"
+                        else:
+                            categoria = "Regular"
                         
                         # Standard convention:
-                        # Cargo (Purchase) -> Increases Balance
-                        # Abono (Payment) -> Decreases Balance
-                        
-                        # If "Pago TDC" has a minus, it reduces the balance. So it's an Abono.
-                        # If "+" is used for purchases... wait, usually it's the other way around in math, but banks are weird.
-                        # Let's assume:
-                        # (-) = Abono (Payment)
-                        # (+) = Cargo (Purchase)
-                        
-                        # Let's just store the signed amount and infer type.
+                        # (-) = Abono (Payment) - reduces debt
+                        # (+) = Cargo (Purchase) - increases debt
                         
                         final_type = "Abono" if data["signo"] == "-" else "Cargo"
                         
                         registros.append({
                             "fecha_oper": data["fecha_op"],
                             "fecha_liq": data["fecha_cargo"],
-                            "descripcion": data["descripcion"],
+                            "descripcion": desc,
                             "monto": monto,
                             "tipo": final_type,
-                            "categoria": "Regular"
+                            "categoria": categoria
                         })
                     except ValueError:
                         pass
 
         return pd.DataFrame(registros)
+
+    def _parse_header(self) -> dict:
+        """Extrae totales del encabezado para validación."""
+        text = self.text
+        
+        def find_money(pattern):
+            m = re.search(pattern, text, re.IGNORECASE)
+            return float(m.group(1).replace(",", "")) if m else 0.0
+
+        def find_money_multi(patterns):
+            for pat in patterns:
+                val = find_money(pat)
+                if val != 0.0:
+                    return val
+            return 0.0
+
+        # Saldo Anterior / Adeudo del periodo anterior
+        saldo_anterior = find_money_multi([
+            r"Adeudo del periodo anterior\s+\$?([\d,]+\.\d{2})",
+            r"Saldo Anterior\s+\$?([\d,]+\.\d{2})"
+        ])
+        
+        # Pagos y Abonos
+        pagos_abonos = find_money_multi([
+            r"Pagos y abonos\s*-\s*\$?([\d,]+\.\d{2})",
+            r"Pagos y Abonos\s+\(\-\)\s+\$?([\d,]+\.\d{2})"
+        ])
+        
+        # Compras y Cargos (regulares + MSI capital)
+        cargos_regulares = find_money(r"Cargos regulares \(no a meses\)\s*\+?\s*\$?([\d,]+\.\d{2})")
+        cargos_msi = find_money(r"Cargos compras a meses \(capital\)\d*\s*\+?\s*\$?([\d,]+\.\d{2})")
+        compras_cargos = cargos_regulares + cargos_msi
+        
+        # TOTAL CARGOS (incluye todos los cargos del periodo, para validar con movimientos)
+        total_cargos = find_money(r"TOTAL CARGOS\s+\$?([\d,]+\.\d{2})")
+        total_abonos = find_money(r"TOTAL ABONOS\s+-?\$?([\d,]+\.\d{2})")
+        
+        if compras_cargos == 0.0:
+            compras_cargos = find_money(r"Compras y Cargos\s+\(\+\)\s+\$?([\d,]+\.\d{2})")
+            cargos_regulares = compras_cargos  # fallback
+        
+        # Saldo Actual / Pago para no generar intereses
+        saldo_actual = find_money_multi([
+            r"PAGO PARA NO GENERAR INTERESES\d*\s+\$?([\d,]+\.\d{2})",
+            r"Pago para no generar intereses:\d*\s+\$?([\d,]+\.\d{2})",
+            r"Saldo Actual\s+\$?([\d,]+\.\d{2})"
+        ])
+        
+        # Periodo
+        periodo_match = re.search(r"Periodo:\s*(\d{2}-[a-z]{3}-\d{4})\s+al\s+(\d{2}-[a-z]{3}-\d{4})", text, re.IGNORECASE)
+        if not periodo_match:
+            periodo_match = re.search(r"Periodo\s+Del\s+(\d{2}/\d{2}/\d{4})\s+al\s+(\d{2}/\d{2}/\d{4})", text, re.IGNORECASE)
+        periodo = f"{periodo_match.group(1)} - {periodo_match.group(2)}" if periodo_match else None
+
+        return {
+            "periodo": periodo,
+            "no_cuenta": self.extract_account_number(),
+            "saldo_anterior": saldo_anterior,
+            "pagos_abonos": pagos_abonos,
+            "compras_cargos": compras_cargos,
+            "cargos_regulares": cargos_regulares,
+            "cargos_msi_capital": cargos_msi,
+            "saldo_actual": saldo_actual,
+            "total_cargos": total_cargos,
+            "total_abonos": total_abonos
+        }
+
+    def _validation_report(self, header: dict, df: pd.DataFrame, tol: float = 0.05) -> dict:
+        # Sumar solo cargos regulares (excluir MSI y MSI_CUOTA que son informativos/duplicados)
+        if not df.empty and "categoria" in df.columns:
+            cargos_df = df[(df["tipo"] == "Cargo") & (df["categoria"] == "Regular")]
+            sum_cargos = float(cargos_df["monto"].sum()) if not cargos_df.empty else 0.0
+        else:
+            sum_cargos = float(df[df["tipo"] == "Cargo"]["monto"].sum()) if not df.empty else 0.0
+        
+        sum_abonos = float(df[df["tipo"] == "Abono"]["monto"].sum()) if not df.empty else 0.0
+        
+        # Comparar cargos regulares con "Cargos regulares (no a meses)" del resumen
+        resumen_cargos = header.get("cargos_regulares") or header.get("compras_cargos") or 0.0
+        resumen_abonos = header.get("pagos_abonos") or 0.0
+        
+        # Para validación de balance, usar compras_cargos (afecta el saldo)
+        saldo_ant = header.get("saldo_anterior") or 0.0
+        saldo_act = header.get("saldo_actual") or 0.0
+        compras_cargos_balance = header.get("compras_cargos") or 0.0
+        pagos_abonos_balance = header.get("pagos_abonos") or 0.0
+        saldo_calc = saldo_ant - pagos_abonos_balance + compras_cargos_balance
+        
+        return {
+            "tipo": "TDC",
+            "controles": {
+                "cargos_vs_resumen_ok": abs(sum_cargos - resumen_cargos) <= tol,
+                "abonos_vs_resumen_ok": abs(sum_abonos - resumen_abonos) <= tol,
+                "balance_header_ok": abs(saldo_calc - saldo_act) <= tol
+            },
+            "detalles": {
+                "sum_cargos_df": sum_cargos,
+                "resumen_cargos": resumen_cargos,
+                "diff_cargos": sum_cargos - resumen_cargos,
+                "sum_abonos_df": sum_abonos,
+                "resumen_abonos": resumen_abonos,
+                "diff_abonos": sum_abonos - resumen_abonos,
+                "saldo_anterior": saldo_ant,
+                "saldo_actual": saldo_act,
+                "saldo_calculado_header": saldo_calc
+            }
+        }
+
+    def parse(self):
+        self.header = self._parse_header()
+        df = self.extract_movements()
+        df = self._normalize_movements(df)  # Ensure dates are normalized
+        report = self._validation_report(self.header, df)
+        
+        return {
+            "account_number": self.extract_account_number(),
+            "movements": df,
+            "metadata": {
+                "account_type": "TDC",
+                "header": self.header,
+                "validation": report
+            }
+        }
 
 
 class ScotiabankCreditParser(BankParser):
@@ -384,6 +667,23 @@ class ScotiabankCreditParser(BankParser):
         """,
         re.VERBOSE,
     )
+    
+    # New pattern for DD/MM format (e.g., "23/09 24/09 STR*UBER... + $26.96")
+    REGULAR_PATTERN_V2 = re.compile(
+        r"""
+        ^(?P<fecha_op>\d{2}/\d{2})               # fecha operación DD/MM
+        \s+
+        (?P<fecha_cargo>\d{2}/\d{2})             # fecha de cargo DD/MM
+        \s+
+        (?P<descripcion>.+?)                     # descripción
+        \s+
+        (?P<signo>[+-])                          # + o -
+        \s*\$(?P<monto>[\d,]+\.\d{2})            # monto
+        $
+        """,
+        re.VERBOSE,
+    )
+
 
     def extract_account_number(self):
         # Attempt to find account number
@@ -410,14 +710,19 @@ class ScotiabankCreditParser(BankParser):
             linea = linea.strip()
             
             # --- Cambios de sección ---
-            if "COMPRAS Y CARGOS DIFERIDOS A MESES SIN INTERESES" in linea:
+            # Handle both spaced and non-spaced versions
+            if "COMPRAS Y CARGOS DIFERIDOS A MESES SIN INTERESES" in linea or \
+               "COMPRASYCARGOSDIFERIDOSAMESESSININTERESES" in linea.replace(" ", ""):
                 print("DEBUG: Entered MSI section")
                 en_msi = True
                 en_regulares = False
                 pendiente_msi = None
                 continue
 
-            if linea.startswith("CARGOS, ABONOS Y COMPRAS REGULARES (NO A MESES)"):
+            # Handle both formats: with spaces and without
+            linea_sin_espacios = linea.replace(" ", "")
+            if "CARGOS,ABONOSYCOMPRASREGULARES" in linea_sin_espacios or \
+               linea.startswith("CARGOS, ABONOS Y COMPRAS REGULARES"):
                 print("DEBUG: Entered Regular section")
                 en_regulares = True
                 en_msi = False
@@ -541,6 +846,8 @@ class ScotiabankCreditParser(BankParser):
             # --- Movimientos regulares (NO a meses) ---
             if en_regulares:
                 r = self.REGULAR_PATTERN.match(linea)
+                if not r:
+                    r = self.REGULAR_PATTERN_V2.match(linea)  # Try V2 pattern
                 if r:
                     data = r.groupdict()
                     try:
@@ -565,71 +872,30 @@ class ScotiabankCreditParser(BankParser):
         return pd.DataFrame(registros)
 
 
-def get_parser(text, pdf_path=None):
+def get_parser(text, pdf_path=None, month_context=None):
     """Factory function to determine the correct parser based on text content."""
     text_upper = text.upper()
     
     print("DEBUG: Detecting parser...")
-    print(f"DEBUG: Text start: {text_upper[:300]}") # Print first 300 chars to see headers
     
     # Check BBVA explicitly first
     if "BBVA" in text_upper or "BANCOMER" in text_upper:
-        print("DEBUG: Detected BBVA/BANCOMER keywords.")
         if "DETALLE DE MOVIMIENTOS REALIZADOS" in text_upper:
-            print("DEBUG: Detected 'DETALLE DE MOVIMIENTOS REALIZADOS' -> BBVADebitParser")
-            return BBVADebitParser(text, pdf_path)
-        print("DEBUG: Defaulting to BBVACreditParser")
-        return BBVACreditParser(text, pdf_path)
+            return BBVADebitParser(text, pdf_path, month_context=month_context)
+        return BBVACreditParser(text, pdf_path, month_context=month_context)
 
-    # Check Scotiabank
-    # Make it stricter: Must have SCOTIABANK in text OR specific unique phrases
-    # "DETALLE DE TUS MOVIMIENTOS" is too generic?
-    # Scotiabank Debit has "DETALLE DE TUS MOVIMIENTOS".
-    # BBVA Debit has "DETALLE DE MOVIMIENTOS REALIZADOS".
-    
-    is_scotiabank = False
-    if "SCOTIABANK" in text_upper[:1000]: # Only check header to avoid transaction descriptions like "SPEI SCOTIABANK"
-        is_scotiabank = True
-    elif "INVERLAT" in text_upper:
-        is_scotiabank = True
-    elif "COMPRAS Y CARGOS DIFERIDOS" in text_upper: # Very specific to Credit
-        is_scotiabank = True
-    elif "DISTRIBUCIÓN DE TU ÚLTIMO PAGO" in text_upper: # Very specific to Credit
-        is_scotiabank = True
-        
-    if is_scotiabank:
-        print("DEBUG: Detected Scotiabank keywords.")
-        
-        # PRIORITIZE Credit/MSI detection
-        if "COMPRAS Y CARGOS DIFERIDOS" in text_upper:
-             print("DEBUG: Detected 'COMPRAS Y CARGOS DIFERIDOS' -> ScotiabankCreditParser")
-             return ScotiabankCreditParser(text, pdf_path)
-             
+    # Scotiabank
+    if "SCOTIABANK" in text_upper or "SCOTIA" in text_upper:
         if "DETALLE DE TUS MOVIMIENTOS" in text_upper:
-             print("DEBUG: Detected 'DETALLE DE TUS MOVIMIENTOS' -> ScotiabankDebitParser")
-             return ScotiabankDebitParser(text, pdf_path)
-        
-        # Fallback if we know it's Scotiabank but don't see specific section headers
-        # Maybe check for "CUENTA UNICA" (Debit) vs "TARJETA DE CREDITO"
-        if "CUENTA UNICA" in text_upper or "CUENTA DE DEPOSITO" in text_upper:
-            print("DEBUG: Detected 'CUENTA UNICA/DEPOSITO' -> ScotiabankDebitParser")
-            return ScotiabankDebitParser(text, pdf_path)
+            # We would need ScotiabankDebitParser here
+            return ScotiabankDebitParser(text, pdf_path, month_context=month_context)
+        return ScotiabankCreditParser(text, pdf_path, month_context=month_context)
 
-        print("DEBUG: Defaulting to ScotiabankCreditParser")
-        return ScotiabankCreditParser(text, pdf_path)
-        
-    # Check Banorte
+    # Banorte
     if "BANORTE" in text_upper:
-        print("DEBUG: Detected BANORTE keywords.")
-        # For now, default to Credit as we only have BanorteCreditParser
-        return BanorteCreditParser(text, pdf_path)
-    
-    print("DEBUG: No parser detected.")
+        return BanorteCreditParser(text, pdf_path, month_context=month_context)
+
     return None
-
-# We do not import AI parsers here to avoid circular imports. 
-# They will be instantiated directly in app.py based on user selection.
-
 
 
 
@@ -849,55 +1115,117 @@ class ScotiabankDebitParser(BankParser):
 
     def extract_movements(self) -> pd.DataFrame:
         """
-        Recorre todas las páginas, extrae los movimientos y los normaliza a un
-        DataFrame estándar con columnas:
-
-        - fecha_oper
-        - fecha_liq
-        - descripcion
-        - monto
-        - tipo ("Abono"/"Cargo"/"Desconocido")
-        - categoria ("Regular")
-        - saldo_calculado
+        Extrae movimientos usando análisis de texto puro.
+        Línea ejemplo: '19 NOV SWEB TRANSF.INTERB SPEI 00000000000000181125 $4,500.00 $5,026.32'
         """
         if not getattr(self, "pdf_path", None):
             raise ValueError("ScotiabankDebitParser requires pdf_path to be set.")
 
         import pdfplumber
 
-        movimientos = []
-
+        registros = []
+        
+        # Regex para detectar líneas de movimiento
+        # Formato: DD MMM CONCEPTO REFERENCIA [$DEPOSITO] [$RETIRO] $SALDO
+        mov_pattern = re.compile(
+            r'^(\d{1,2})\s+(NOV|DIC|ENE|FEB|MAR|ABR|MAY|JUN|JUL|AGO|SEP|OCT)\s+'
+            r'(.+?)'  # Concepto + Referencia
+            r'\s+\$([0-9,]+\.\d{2})'  # Primer monto
+            r'(?:\s+\$([0-9,]+\.\d{2}))?'  # Segundo monto (opcional)
+            r'(?:\s+\$([0-9,]+\.\d{2}))?$',  # Tercer monto (opcional - saldo)
+            re.IGNORECASE
+        )
+        
+        current_mov = None
+        
         with pdfplumber.open(self.pdf_path) as pdf:
             for page in pdf.pages:
-                movs_page = self._extraer_movimientos_pagina(page)
-                movimientos.extend(movs_page)
-
-        registros = []
-        for m in movimientos:
-            deposito = self._parse_monto(m.get("deposito", ""))
-            retiro = self._parse_monto(m.get("retiro", ""))
-
-            monto = 0.0
-            tipo = "Desconocido"
-
-            if deposito > 0:
-                monto = deposito
-                tipo = "Abono"
-            elif retiro > 0:
-                monto = retiro
-                tipo = "Cargo"
-
-            registros.append({
-                "fecha_oper": m.get("fecha"),
-                "fecha_liq": m.get("fecha"),  # en débito casi siempre es el mismo día
-                "descripcion": f"{m.get('concepto', '')} {m.get('origen', '')}".strip(),
-                "monto": monto,
-                "tipo": tipo,
-                "categoria": "Regular",
-                "saldo_calculado": self._parse_monto(m.get("saldo", "")),
-            })
+                text = page.extract_text() or ''
+                lines = text.split('\n')
+                
+                for line in lines:
+                    line = line.strip()
+                    
+                    # Skip known non-transaction lines
+                    if not line or 'Detalle' in line or 'Fecha' in line and 'Concepto' in line:
+                        continue
+                    if 'TASAS DE INTERES' in line or 'efectos del art' in line:
+                        continue
+                    
+                    match = mov_pattern.match(line)
+                    if match:
+                        # Flush previous movement if any
+                        if current_mov:
+                            registros.append(current_mov)
+                        
+                        day, month, descripcion, m1, m2, m3 = match.groups()
+                        
+                        # Parse amounts - determine which is deposit, withdrawal, balance
+                        montos = [m for m in [m1, m2, m3] if m]
+                        
+                        deposito = 0.0
+                        retiro = 0.0
+                        saldo = 0.0
+                        
+                        if len(montos) == 3:
+                            # Deposito, Retiro, Saldo
+                            deposito = self._parse_monto(montos[0])
+                            retiro = self._parse_monto(montos[1]) if montos[1] else 0.0
+                            saldo = self._parse_monto(montos[2])
+                        elif len(montos) == 2:
+                            # Either (Deposito, Saldo) or (Retiro, Saldo)
+                            # Withdrawals: SWEB (transfers out), PAGO, COBRANZA
+                            # Deposits: NOMINA, TRANSF INTERBANCARIA SPEI (incoming)
+                            desc_upper = descripcion.upper()
+                            is_withdrawal = (
+                                'SWEB' in desc_upper or
+                                'PAGO' in desc_upper or 
+                                'COBRANZA' in desc_upper
+                            )
+                            is_deposit = (
+                                'NOMINA' in desc_upper or
+                                ('TRANSF' in desc_upper and 'SWEB' not in desc_upper)
+                            )
+                            
+                            if is_withdrawal:
+                                retiro = self._parse_monto(montos[0])
+                                saldo = self._parse_monto(montos[1])
+                            else:
+                                deposito = self._parse_monto(montos[0])
+                                saldo = self._parse_monto(montos[1])
+                        elif len(montos) == 1:
+                            saldo = self._parse_monto(montos[0])
+                        
+                        # Determine type
+                        tipo = "Desconocido"
+                        monto = 0.0
+                        if deposito > 0:
+                            monto = deposito
+                            tipo = "Abono"
+                        elif retiro > 0:
+                            monto = retiro
+                            tipo = "Cargo"
+                        
+                        current_mov = {
+                            "fecha_oper": f"{day.zfill(2)} {month.upper()}",
+                            "fecha_liq": f"{day.zfill(2)} {month.upper()}",
+                            "descripcion": descripcion.strip(),
+                            "monto": monto,
+                            "tipo": tipo,
+                            "categoria": "Regular",
+                            "saldo_calculado": saldo,
+                        }
+                    elif current_mov:
+                        # Continuation line - append to description
+                        if line and not line.startswith('$') and len(line) > 3:
+                            current_mov["descripcion"] += " " + line
+                
+        # Flush last movement
+        if current_mov:
+            registros.append(current_mov)
 
         return pd.DataFrame(registros)
+
 
 
 class BanorteCreditParser(BankParser):
@@ -1125,16 +1453,42 @@ class BanorteCreditParser(BankParser):
         def money(val):
             return self._parse_monto(val) if val else 0.0
 
-        # Buscar totales explícitos al final de la sección regular
-        # Patron más flexible: "Total cargos" seguido de signo opcional, espacio y monto
-        total_cargos_match = re.search(r"Total\s+cargos\s*[+]?\s*\$?([\d,]+\.\d{2})", text, re.IGNORECASE)
-        total_abonos_match = re.search(r"Total\s+abonos\s*[-]?\s*\$?([\d,]+\.\d{2})", text, re.IGNORECASE)
-        
-        # Buscar saldo anterior (Adeudo del periodo anterior)
-        saldo_ant_match = re.search(r"Adeudo\s+del\s+periodo\s+anterior\s*\$?([\d,]+\.\d{2})", text, re.IGNORECASE)
-        
-        # Pago para no generar intereses (puede tener superíndice 2)
-        saldo_corte_match = re.search(r"Pago\s+para\s+no\s+generar\s+intereses\s*:?\s*\d?\s*\$?([\d,]+\.\d{2})", text, re.IGNORECASE)
+        def find_money(patterns):
+            for pat in patterns:
+                m = re.search(pat, text, re.IGNORECASE)
+                if m:
+                    return money(m.group(1))
+            return 0.0
+
+        # Patterns for Saldo Anterior
+        saldo_ant_patterns = [
+            r"Adeudo\s+del\s+periodo\s+anterior\s*\$?([\d,]+\.\d{2})",
+            r"Saldo\s*Anterior\s*\$([\d,]+\.\d{2})",
+            r"Saldo\s*anterior\s*:\s*\$([\d,]+\.\d{2})"
+        ]
+
+        # Patterns for Pagos y Abonos
+        abonos_patterns = [
+            r"Total\s+abonos\s*[-]?\s*\$?([\d,]+\.\d{2})",
+            r"Pagos\s*y\s*Abonos\s*[-]?\s*\$([\d,]+\.\d{2})",
+            r"Pagos\s*y\s*abonos\s*:\s*\$([\d,]+\.\d{2})"
+        ]
+
+        # Patterns for Compras y Cargos
+        cargos_patterns = [
+            r"Total\s+cargos\s*[+]?\s*\$?([\d,]+\.\d{2})",
+            r"Compras\s*y\s*Cargos\s*\$([\d,]+\.\d{2})",
+            r"Compras\s*y\s*cargos\s*:\s*\$([\d,]+\.\d{2})",
+            r"Nuevas\s*compras\s*:\s*\$([\d,]+\.\d{2})"
+        ]
+
+        # Patterns for Saldo Actual / Nuevo Saldo
+        saldo_act_patterns = [
+            r"Pago\s+para\s+no\s+generar\s+intereses\s*:?\s*\d?\s*\$?([\d,]+\.\d{2})",
+            r"Saldo\s*Actual\s*\$([\d,]+\.\d{2})",
+            r"Nuevo\s*Saldo\s*\$([\d,]+\.\d{2})",
+            r"Saldo\s*al\s*corte\s*\$([\d,]+\.\d{2})"
+        ]
 
         header = {
             "periodo": find(r"Periodo\s*:\s*([^\n]+)"),
@@ -1142,10 +1496,10 @@ class BanorteCreditParser(BankParser):
             "no_cuenta": self.extract_account_number(),
             
             # Totales
-            "saldo_anterior": money(saldo_ant_match.group(1)) if saldo_ant_match else 0.0,
-            "pagos_abonos": money(total_abonos_match.group(1)) if total_abonos_match else 0.0,
-            "compras_cargos": money(total_cargos_match.group(1)) if total_cargos_match else 0.0,
-            "saldo_actual": money(saldo_corte_match.group(1)) if saldo_corte_match else 0.0,
+            "saldo_anterior": find_money(saldo_ant_patterns),
+            "pagos_abonos": find_money(abonos_patterns),
+            "compras_cargos": find_money(cargos_patterns),
+            "saldo_actual": find_money(saldo_act_patterns),
         }
         return header
 
@@ -1204,84 +1558,7 @@ class BanorteCreditParser(BankParser):
             }
         }
 
-    # ==========================================
-    # VALIDACIÓN Y HEADER
-    # ==========================================
 
-    def _parse_header(self) -> dict:
-        """Extrae totales del encabezado para validación."""
-        text = self.text
-        
-        def find(pattern):
-            m = re.search(pattern, text, re.IGNORECASE)
-            return m.group(1).strip() if m else None
-            
-        def money(val):
-            return self._parse_monto(val)
-
-        # Patrones comunes en Banorte (ajustar según ejemplos reales)
-        # Buscamos en las primeras líneas o en el resumen
-        
-        header = {
-            "periodo": find(r"Periodo\s*:\s*([^\n]+)"),
-            "fecha_corte": find(r"Fecha\s*de\s*Corte\s*:\s*(\d{2}-[A-Z]{3}-\d{4})"),
-            "no_cuenta": self.extract_account_number(),
-            # Resumen de saldos
-            "saldo_anterior": money(find(r"Saldo\s*Anterior\s*\$([\d,]+\.\d{2})")),
-            "pagos_abonos": money(find(r"Pagos\s*y\s*Abonos\s*[-]?\s*\$([\d,]+\.\d{2})")),
-            "compras_cargos": money(find(r"Compras\s*y\s*Cargos\s*\$([\d,]+\.\d{2})")),
-            "saldo_actual": money(find(r"Saldo\s*Actual\s*\$([\d,]+\.\d{2})")),
-        }
-        return header
-
-    def _validation_report(self, header: dict, df: pd.DataFrame, tol: float = 0.05) -> dict:
-        """Genera reporte de validación comparando totales extraídos vs header."""
-        sum_cargos = float(df[df["tipo"] == "Cargo"]["monto"].sum()) if not df.empty else 0.0
-        sum_abonos = float(df[df["tipo"] == "Abono"]["monto"].sum()) if not df.empty else 0.0
-        
-        resumen_cargos = header.get("compras_cargos") or 0.0
-        resumen_abonos = header.get("pagos_abonos") or 0.0
-        
-        # Validación de saldo: Saldo Anterior - Pagos + Compras = Saldo Actual
-        saldo_ant = header.get("saldo_anterior") or 0.0
-        saldo_act = header.get("saldo_actual") or 0.0
-        saldo_calc = saldo_ant - resumen_abonos + resumen_cargos
-        
-        return {
-            "tipo": "TDC",
-            "controles": {
-                "cargos_vs_resumen_ok": abs(sum_cargos - resumen_cargos) <= tol,
-                "abonos_vs_resumen_ok": abs(sum_abonos - resumen_abonos) <= tol,
-                "balance_header_ok": abs(saldo_calc - saldo_act) <= tol
-            },
-            "detalles": {
-                "sum_cargos_df": sum_cargos,
-                "resumen_cargos": resumen_cargos,
-                "diff_cargos": sum_cargos - resumen_cargos,
-                "sum_abonos_df": sum_abonos,
-                "resumen_abonos": resumen_abonos,
-                "diff_abonos": sum_abonos - resumen_abonos,
-                "saldo_anterior": saldo_ant,
-                "saldo_actual": saldo_act,
-                "saldo_calculado_header": saldo_calc
-            }
-        }
-
-    def parse(self):
-        """Ejecuta el parsing completo y retorna resultado con metadata."""
-        self.header = self._parse_header()
-        df = self.extract_movements()
-        report = self._validation_report(self.header, df)
-        
-        return {
-            "account_number": self.extract_account_number(),
-            "movements": df,
-            "metadata": {
-                "account_type": "TDC",
-                "header": self.header,
-                "validation": report
-            }
-        }
 
         
 # ==========================================
@@ -1307,8 +1584,8 @@ class ScotiabankV2Parser(BankParser):
     DATE_RE = re.compile(r"^(?P<day>\d{2})\s+(?P<mon>ENE|FEB|MAR|ABR|MAY|JUN|JUL|AGO|SEP|OCT|NOV|DIC)\b", re.IGNORECASE)
     MONEY_RE = re.compile(r"\$[\d,]+\.\d{2}")
 
-    def __init__(self, text, pdf_path=None):
-        super().__init__(text, pdf_path)
+    def __init__(self, text, pdf_path=None, month_context=None):
+        super().__init__(text, pdf_path, month_context=month_context)
         self.lines = self._extract_lines()
         self.account_type = self._detect_account_type()
         self.header = {}

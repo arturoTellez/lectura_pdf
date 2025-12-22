@@ -8,6 +8,7 @@ requests
 python-dotenv
 pymupdf
 google-genai
-
-
+fastapi
+uvicorn
+python-multipart
 
