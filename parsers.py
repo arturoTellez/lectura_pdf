@@ -83,6 +83,10 @@ class BankParser(ABC):
         """Extracts movements and returns a DataFrame."""
         pass
 
+    def extract_balances(self):
+        """Extracts initial and final balances. Returns (saldo_inicial, saldo_final, fecha_corte)."""
+        return None, None, None
+
     def _normalize_movements(self, df):
         """Final pass to ensure all dates are normalized in the resulting DataFrame."""
         if df.empty:
@@ -131,6 +135,40 @@ class BBVADebitParser(BankParser):
             charges = float(m_chr.group(1).replace(",", ""))
             
         return deposits, charges
+
+    def extract_balances(self):
+        """Extracts initial and final balances for BBVA Debit."""
+        text = self.text
+        
+        def find_money(pattern):
+            m = re.search(pattern, text, re.IGNORECASE)
+            return float(m.group(1).replace(",", "")) if m else 0.0
+
+        def find_money_multi(patterns):
+            for pat in patterns:
+                val = find_money(pat)
+                if val != 0.0:
+                    return val
+            return 0.0
+
+        saldo_inicial = find_money_multi([
+            r"Saldo Anterior\s+\$?([\d,]+\.\d{2})",
+            r"Saldo\s+anterior\s*:\s*\$?([\d,]+\.\d{2})",
+            r"Saldo\s+Inicial\s+\$?([\d,]+\.\d{2})"
+        ])
+        
+        saldo_final = find_money_multi([
+            r"Saldo Actual\s+\$?([\d,]+\.\d{2})",
+            r"Saldo\s+actual\s*:\s*\$?([\d,]+\.\d{2})",
+            r"Saldo\s+Final\s+\$?([\d,]+\.\d{2})"
+        ])
+        
+        fecha_corte = None
+        m_corte = re.search(r"FECHA DE CORTE\s+(\d{2}/\d{2}/\d{4})", text, re.IGNORECASE)
+        if m_corte:
+            fecha_corte = m_corte.group(1)
+            
+        return saldo_inicial, saldo_final, fecha_corte
 
     def _obtener_bloque(self):
         ini = self.text.find("Detalle de Movimientos Realizados")
@@ -575,6 +613,15 @@ class BBVACreditParser(BankParser):
             "total_cargos": total_cargos,
             "total_abonos": total_abonos
         }
+
+    def extract_balances(self):
+        """Extracts initial and final balances for BBVA Credit."""
+        header = self._parse_header()
+        # Extract fecha_corte from periodo if possible
+        fecha_corte = None
+        if header.get("periodo") and " - " in header["periodo"]:
+            fecha_corte = header["periodo"].split(" - ")[1]
+        return header["saldo_anterior"], header["saldo_actual"], fecha_corte
 
     def _validation_report(self, header: dict, df: pd.DataFrame, tol: float = 0.05) -> dict:
         # Sumar solo cargos regulares (excluir MSI y MSI_CUOTA que son informativos/duplicados)
@@ -1691,6 +1738,16 @@ class ScotiabankV2Parser(BankParser):
                 header[k] = self._money_to_float(header[k])
 
         return header
+
+    def extract_balances(self):
+        """Extracts initial and final balances for Scotiabank."""
+        if self.account_type == "CHECKING":
+            header = self._parse_checking_header()
+            return header["saldo_inicial"], header["saldo_final"], header["fecha_corte"]
+        elif self.account_type == "TDC":
+            header = self._parse_tdc_header()
+            return header["saldo_anterior"], header["saldo_actual"], header["fecha_corte"]
+        return None, None, None
 
     def _classify_amount_checking(self, amount: float, concept: str):
         """Clasifica un monto como depósito o retiro basado en el concepto."""

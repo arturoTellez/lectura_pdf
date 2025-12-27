@@ -14,6 +14,10 @@ document.addEventListener('DOMContentLoaded', () => {
             sectionTitle.textContent = btn.textContent.trim();
 
             if (target === 'dashboard') loadDashboard();
+            if (target === 'upload') {
+                loadUploadMatrix();
+                loadUploads();
+            }
             if (target === 'reports') loadReports();
             if (target === 'recurrence') loadRecurrence();
         });
@@ -165,43 +169,50 @@ document.addEventListener('DOMContentLoaded', () => {
 
         const modalHtml = `
             <div id="duplicates-modal" class="modal-overlay">
-                <div class="modal-content" style="max-width: 750px;">
+                <div class="modal-content" style="max-width: 900px;">
                     <header class="modal-header">
-                        <h2>⚠️ Transacciones Duplicadas Detectadas</h2>
+                        <h2>⚠️ Duplicados en Base de Datos</h2>
                         <button class="icon-btn close-dup-modal">✕</button>
                     </header>
                     <div class="modal-body">
-                        <p style="margin-bottom: 0.5rem; color: var(--md-sys-color-on-surface-variant);">
-                            Se detectaron <strong>${duplicates.length} transacciones</strong> que ya existen con la 
-                            <strong>misma fecha, monto y descripción</strong>.
-                        </p>
-                        <p style="margin-bottom: 1rem; color: var(--md-sys-color-on-surface-variant); font-size: 0.9rem;">
-                            Si realizaste la misma transacción varias veces el mismo día (ej: 2 pagos de $1,200 el 01-dic), 
-                            márcalas para guardarlas. Si no, déjalas desmarcadas.
-                        </p>
-                        <div class="table-container" style="max-height: 300px; overflow-y: auto;">
-                            <table>
+                        <p style="margin-bottom: 1rem;">Se encontraron movimientos que ya existen en la base de datos. Compara y elige qué hacer para cada uno.</p>
+                        <div class="table-container" style="max-height: 400px; overflow-y: auto;">
+                            <table class="comparison-table">
                                 <thead>
                                     <tr>
-                                        <th>Guardar</th>
-                                        <th>📅 Fecha + 💰 Monto</th>
-                                        <th>Descripción</th>
-                                        <th>Tipo</th>
+                                        <th>Existente en BD</th>
+                                        <th>Nuevo en Archivo</th>
+                                        <th>Acción</th>
                                     </tr>
                                 </thead>
                                 <tbody>${duplicates.map((d, i) => `
-                                    <tr>
-                                        <td><input type="checkbox" class="dup-checkbox" data-index="${i}"></td>
-                                        <td><strong style="color: var(--md-sys-color-primary);">${d.fecha_oper}</strong><br><span style="font-weight: 600;">${formatCurrency(d.monto)}</span></td>
-                                        <td title="${d.descripcion}">${d.descripcion.substring(0, 35)}${d.descripcion.length > 35 ? '...' : ''}</td>
-                                        <td>${d.tipo}</td>
+                                    <tr data-index="${i}">
+                                        <td class="existing-data" style="padding: 10px; border-bottom: 1px solid #eee;">
+                                            <div style="font-weight: 600; color: var(--md-sys-color-primary);">${d.existing.fecha_oper}</div>
+                                            <div style="font-size: 1.1rem; font-weight: 700;">${formatCurrency(d.existing.monto)}</div>
+                                            <div style="font-size: 0.85rem; color: #666;">${d.existing.tipo}</div>
+                                            <div style="font-size: 0.8rem; margin-top: 4px;">${d.existing.descripcion}</div>
+                                        </td>
+                                        <td class="new-data" style="padding: 10px; border-bottom: 1px solid #eee; background-color: #f9f9f9;">
+                                            <div style="font-weight: 600; color: var(--md-sys-color-primary);">${d.new.fecha_oper}</div>
+                                            <div style="font-size: 1.1rem; font-weight: 700;">${formatCurrency(d.new.monto)}</div>
+                                            <div style="font-size: 0.85rem; color: #666;">${d.new.tipo}</div>
+                                            <div style="font-size: 0.8rem; margin-top: 4px;">${d.new.descripcion}</div>
+                                        </td>
+                                        <td style="padding: 10px; border-bottom: 1px solid #eee; vertical-align: middle;">
+                                            <select class="dup-action" data-index="${i}" style="width: 100%; padding: 8px; border-radius: 8px; border: 1px solid #ccc;">
+                                                <option value="keep_existing">Conservar Existente</option>
+                                                <option value="replace_with_new">Reemplazar con Nuevo</option>
+                                                <option value="keep_both">Conservar Ambos</option>
+                                            </select>
+                                        </td>
                                     </tr>
                                 `).join('')}</tbody>
                             </table>
                         </div>
-                        <div style="margin-top: 1rem; display: flex; gap: 1rem; justify-content: flex-end;">
-                            <button class="secondary-btn close-dup-modal">Ignorar todos</button>
-                            <button class="primary-btn" id="confirm-dups-btn">Guardar seleccionados</button>
+                        <div style="margin-top: 1.5rem; display: flex; gap: 1rem; justify-content: flex-end;">
+                            <button class="secondary-btn close-dup-modal">Cerrar</button>
+                            <button class="primary-btn" id="confirm-dups-btn">Procesar Resoluciones</button>
                         </div>
                     </div>
                 </div>
@@ -216,44 +227,46 @@ document.addEventListener('DOMContentLoaded', () => {
         });
 
         document.getElementById('confirm-dups-btn').onclick = async () => {
-            const selected = [];
-            document.querySelectorAll('.dup-checkbox:checked').forEach(cb => {
-                selected.push(duplicates[parseInt(cb.dataset.index)]);
+            const resolutions = [];
+            document.querySelectorAll('.dup-action').forEach(select => {
+                const idx = parseInt(select.dataset.index);
+                const action = select.value;
+                if (action !== 'keep_existing') {
+                    resolutions.push({
+                        action: action,
+                        existing_id: duplicates[idx].existing.id,
+                        new_data: duplicates[idx].new,
+                        account_number: result.account,
+                        bank_name: result.bank,
+                        account_type: result.account_type,
+                        upload_id: result.upload_id
+                    });
+                }
             });
 
-            if (selected.length === 0) {
+            if (resolutions.length === 0) {
                 document.getElementById('duplicates-modal').remove();
                 return;
             }
 
             try {
-                const confirmRes = await fetch('/confirm-duplicates', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        duplicates: selected,
-                        account_number: result.account,
-                        bank: result.bank,
-                        account_type: result.account_type,
-                        upload_id: result.upload_id
-                    })
-                });
-                const confirmData = await confirmRes.json();
-                if (confirmData.status === 'success') {
-                    showFeedback(`${confirmData.saved_count} transacciones duplicadas guardadas.`);
+                // Process each resolution
+                for (const res of resolutions) {
+                    await fetch('/resolve-duplicate', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(res)
+                    });
                 }
+                showFeedback(`Se procesaron ${resolutions.length} resoluciones de duplicados.`);
             } catch (e) {
-                showFeedback('Error al guardar duplicados', true);
+                showFeedback('Error al procesar duplicados', true);
             }
 
             document.getElementById('duplicates-modal').remove();
             loadUploads();
         };
     }
-
-    // Initial load
-    loadUploadMatrix();
-    loadUploads();
 
     // Load uploads history
     async function loadUploads() {
@@ -507,13 +520,17 @@ document.addEventListener('DOMContentLoaded', () => {
 
         const ctxEvolution = document.getElementById('evolutionChart').getContext('2d');
         if (evolutionChart) evolutionChart.destroy();
+
+        const evoLabels = data.evolution?.labels || [];
+        const evoValues = data.evolution?.values || [];
+
         evolutionChart = new Chart(ctxEvolution, {
             type: 'line',
             data: {
-                labels: ['Oct', 'Nov', 'Dic'],
+                labels: evoLabels,
                 datasets: [{
                     label: 'Gastos',
-                    data: [12000, 15000, 18000],
+                    data: evoValues,
                     borderColor: '#4f46e5',
                     backgroundColor: 'rgba(79, 70, 229, 0.1)',
                     fill: true,
@@ -541,11 +558,26 @@ document.addEventListener('DOMContentLoaded', () => {
 
         // Validation Status
         const statusBox = document.getElementById('validation-status');
-        const validation = result.metadata?.validation?.controles || {};
-        const allOk = Object.values(validation).every(v => v === true);
+        const control = result.control_figures || {};
+        const internalDups = result.internal_duplicates || {};
+        
+        let statusHtml = '';
+        let statusClass = 'success';
 
-        statusBox.className = `status-box ${allOk ? 'success' : 'error'}`;
-        statusBox.innerHTML = allOk ? '✅ Validación completa: El balance coincide.' : '⚠️ Se detectaron discrepancias en la validación.';
+        if (control.ok) {
+            statusHtml = '✅ Validación completa: El balance coincide.';
+        } else {
+            statusHtml = `⚠️ <strong>Discrepancia detectada:</strong> El balance esperado (${formatCurrency(control.expected_diff)}) no coincide con la suma de movimientos (${formatCurrency(control.actual_diff)}).`;
+            statusClass = 'error';
+        }
+
+        if (internalDups.found) {
+            statusHtml += `<br>🔍 <strong>Duplicados internos:</strong> Se encontraron ${internalDups.count} posibles duplicados dentro del mismo archivo.`;
+            statusClass = 'error';
+        }
+
+        statusBox.className = `status-box ${statusClass}`;
+        statusBox.innerHTML = statusHtml;
 
         // Header Details
         const detailsGrid = document.getElementById('header-details');
@@ -593,4 +625,6 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Initial Load
     loadDashboard();
+    loadUploadMatrix();
+    loadUploads();
 });

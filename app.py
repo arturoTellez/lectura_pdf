@@ -50,9 +50,23 @@ def get_db_connection():
     conn = sqlite3.connect(database.DB_PATH)
     return conn
 
-def load_data():
+def load_data(include_msi=False):
     conn = get_db_connection()
     df = pd.read_sql_query("SELECT * FROM movements", conn)
+    
+    if include_msi:
+        msi_df = pd.read_sql_query("SELECT * FROM msi_movements", conn)
+        if not msi_df.empty:
+            # Standardize columns to match movements for concatenation if needed
+            msi_df["categoria"] = "MSI"
+            msi_df["tipo"] = "Cargo MSI Informativo"
+            # Map msi columns to movement columns
+            msi_df = msi_df.rename(columns={
+                "monto_original": "meta_monto_original",
+                "saldo_pendiente": "meta_saldo_pendiente"
+            })
+            df = pd.concat([df, msi_df], ignore_index=True)
+            
     conn.close()
     
     # Enforce numeric types for meta columns to avoid PyArrow errors
@@ -239,7 +253,7 @@ def process_pdf(uploaded_file, manual_parser_name=None):
 
 # --- Sidebar ---
 st.sidebar.title("Navegación")
-page = st.sidebar.radio("Ir a", ["Cargar Archivos", "Dashboard", "Clasificación", "Proyección de Flujo"])
+page = st.sidebar.radio("Ir a", ["Cargar Archivos", "Dashboard", "Clasificación", "Seguimiento MSI", "Proyección de Flujo"])
 
 # --- Page: Cargar Archivos ---
 if page == "Cargar Archivos":
@@ -364,11 +378,44 @@ elif page == "Clasificación":
             st.success(f"Se actualizaron {count} movimientos.")
             st.rerun()
 
+# --- Page: Seguimiento MSI ---
+elif page == "Seguimiento MSI":
+    st.title("💳 Seguimiento de Meses Sin Intereses (MSI)")
+    
+    conn = get_db_connection()
+    msi_df = pd.read_sql_query("SELECT * FROM msi_movements", conn)
+    conn.close()
+    
+    if msi_df.empty:
+        st.info("No se han detectado movimientos a Meses Sin Intereses.")
+    else:
+        # Filters
+        banks = ["Todos"] + sorted(msi_df["bank"].unique().tolist())
+        selected_bank = st.selectbox("Filtrar por Banco", banks)
+        
+        filtered_msi = msi_df.copy()
+        if selected_bank != "Todos":
+            filtered_msi = filtered_msi[filtered_msi["bank"] == selected_bank]
+            
+        # Summary metrics
+        total_pending = filtered_msi["saldo_pendiente"].sum()
+        total_monthly = filtered_msi["monto"].sum()
+        
+        col1, col2 = st.columns(2)
+        col1.metric("Total Saldo Pendiente", f"${total_pending:,.2f}")
+        col2.metric("Pago Mensual Total MSI", f"${total_monthly:,.2f}")
+        
+        st.subheader("Detalle de Compras a MSI")
+        st.dataframe(filtered_msi[[
+            "fecha_oper", "bank", "descripcion", "monto", "monto_original", 
+            "saldo_pendiente", "pago_numero", "pagos_totales"
+        ]], hide_index=True)
+
 # --- Page: Proyección de Flujo ---
 elif page == "Proyección de Flujo":
     st.title("🔮 Proyección de Flujo de Efectivo")
     
-    df = load_data()
+    df = load_data(include_msi=True)
     
     if df.empty:
         st.info("No hay datos.")

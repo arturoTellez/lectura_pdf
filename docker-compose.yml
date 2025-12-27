@@ -1,0 +1,40 @@
+services:
+  estados-cuenta:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: lectura-estados-cuenta
+    restart: always  # Se reinicia automáticamente al iniciar la computadora
+    ports:
+      - "8000:8000"
+    volumes:
+      # Montar el código fuente para desarrollo (refleja cambios inmediatamente)
+      - .:/app
+      # Persistir la base de datos SQLite
+      - ./data:/app/data
+      # Persistir archivos subidos
+      - ./uploads:/app/uploads
+    environment:
+      - TZ=America/Mexico_City
+    env_file:
+      - .env
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks:
+      - estados-cuenta-network
+
+networks:
+  estados-cuenta-network:
+    driver: bridge
+
+volumes:
+  estados-cuenta-db:
+  estados-cuenta-uploads:
+
+# Para iniciar: podman-compose up -d
+# Para ver logs: podman-compose logs -f
+# Para detener: podman-compose down
